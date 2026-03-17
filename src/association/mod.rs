@@ -161,6 +161,7 @@ pub struct Association {
     my_next_rsn: u32,
     reconfigs: FxHashMap<u32, ChunkReconfig>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
+    max_completed_reconfig_rsn: Option<u32>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -249,6 +250,7 @@ impl Default for Association {
             my_next_rsn: 0,
             reconfigs: FxHashMap::default(),
             reconfig_requests: FxHashMap::default(),
+            max_completed_reconfig_rsn: None,
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -1630,7 +1632,11 @@ impl Association {
             let rst_reqs: Vec<ParamOutgoingResetRequest> =
                 self.reconfig_requests.values().cloned().collect();
             for rst_req in rst_reqs {
+                let seq = rst_req.reconfig_request_sequence_number;
                 self.reset_streams_if_any(&rst_req, false, &mut reply)?;
+                if !self.reconfig_requests.contains_key(&seq) {
+                    self.max_completed_reconfig_rsn = Some(seq);
+                }
             }
         }
 
@@ -1669,9 +1675,35 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            let seq = p.reconfig_request_sequence_number;
+            // Detect retransmission of a completed request. An InProgress request
+            // is still in reconfig_requests, so we must let those through for
+            // re-evaluation (the TSN may have advanced).
+            if !self.reconfig_requests.contains_key(&seq)
+                && self
+                    .max_completed_reconfig_rsn
+                    .is_some_and(|w| sna32lte(seq, w))
+            {
+                // Retransmission of an already-completed request. Resend the response
+                // but do NOT reprocess stream resets (stream IDs may have been reused).
+                let packet = self.create_packet(vec![Box::new(ChunkReconfig {
+                    param_a: Some(Box::new(ParamReconfigResponse {
+                        reconfig_response_sequence_number: seq,
+                        result: ReconfigResult::SuccessPerformed,
+                    })),
+                    param_b: None,
+                })]);
+                reply.push(packet);
+                return Ok(());
+            }
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
             self.reset_streams_if_any(p, true, reply)?;
+            // Update watermark only after successful completion (request
+            // removed from reconfig_requests by reset_streams_if_any).
+            if !self.reconfig_requests.contains_key(&seq) {
+                self.max_completed_reconfig_rsn = Some(seq);
+            }
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
             self.reconfigs.remove(&p.reconfig_response_sequence_number);
