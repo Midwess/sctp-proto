@@ -1,4 +1,7 @@
 # Unreleased
+
+# 0.9.0
+
   * Add support for out of band negotiation for SNAP #34
   * Deduplicate incoming RE-CONFIG requests to prevent new stream destruction #30
   * Replace lazy_static with std::sync::LazyLock in tests #41
