@@ -411,6 +411,130 @@ fn test_handle_sack_marks_rack_loss_for_older_outstanding_chunk() -> Result<()> 
 }
 
 #[test]
+fn test_on_rack_timeout_marks_overdue_original_chunk_for_retransmit() {
+    let now = Instant::now();
+    let mut a = Association {
+        state: AssociationState::Established,
+        rack_reo_wnd: Duration::from_millis(10),
+        rack_delivered_time: Some(now),
+        ..Default::default()
+    };
+
+    push_outstanding_chunk(&mut a, 10, now - Duration::from_millis(50), 100);
+
+    a.on_rack_timeout(now);
+
+    assert!(
+        a.inflight_queue.get(10).is_some_and(|chunk| chunk.retransmit),
+        "RACK timeout should mark overdue original transmission lost"
+    );
+    assert_eq!(1, a.stats.get_num_rack_loss_marks());
+}
+
+#[test]
+fn test_on_rack_after_sack_duplicate_tsn_inflates_and_decays_reo_wnd() {
+    let now = Instant::now();
+    let mut a = Association {
+        rack_min_rtt: Duration::from_millis(100),
+        rack_reo_wnd: Duration::from_millis(25),
+        rack_keep_inflated_recoveries: 0,
+        ..Default::default()
+    };
+
+    let dsack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 99,
+        advertised_receiver_window_credit: 0,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![123],
+    };
+
+    a.on_rack_after_sack(now, None, 0, false, &dsack);
+    assert_eq!(Duration::from_millis(50), a.rack_reo_wnd);
+    assert_eq!(15, a.rack_keep_inflated_recoveries);
+
+    let empty = ChunkSelectiveAck {
+        cumulative_tsn_ack: 99,
+        advertised_receiver_window_credit: 0,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+
+    a.on_rack_after_sack(now, None, 0, false, &empty);
+    assert_eq!(14, a.rack_keep_inflated_recoveries);
+
+    a.rack_keep_inflated_recoveries = 1;
+    a.on_rack_after_sack(now, None, 0, false, &empty);
+    assert_eq!(0, a.rack_keep_inflated_recoveries);
+    assert_eq!(
+        Duration::from_millis(25),
+        a.rack_reo_wnd,
+        "reoWnd should reset to base after duplicate-TSN inflation decays"
+    );
+}
+
+#[test]
+fn test_on_rack_after_sack_suppresses_reo_wnd_during_recovery_without_reordering() {
+    let now = Instant::now();
+    let mut a = Association {
+        rack_reo_wnd: Duration::from_millis(40),
+        rack_reordering_seen: false,
+        in_fast_recovery: true,
+        ..Default::default()
+    };
+
+    let empty = ChunkSelectiveAck {
+        cumulative_tsn_ack: 0,
+        advertised_receiver_window_credit: 0,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+
+    a.on_rack_after_sack(now, None, 0, false, &empty);
+    assert_eq!(Duration::ZERO, a.rack_reo_wnd);
+
+    a.in_fast_recovery = false;
+    a.on_rack_after_sack(now, None, 0, false, &empty);
+    assert_eq!(
+        Duration::ZERO,
+        a.rack_reo_wnd,
+        "reoWnd should stay suppressed until a valid min-RTT sample exists"
+    );
+
+    a.rack_min_rtt_wnd.push(now, Duration::from_millis(120));
+    a.on_rack_after_sack(now, None, 0, false, &empty);
+    assert_eq!(
+        Duration::from_millis(30),
+        a.rack_reo_wnd,
+        "reoWnd should reinitialize from minRTT/4 after a valid sample"
+    );
+}
+
+#[test]
+fn test_on_rack_after_sack_bounds_reo_wnd_by_srtt() {
+    let now = Instant::now();
+    let mut a = Association {
+        rack_reo_wnd: Duration::from_millis(200),
+        ..Default::default()
+    };
+    a.rto_mgr.set_new_rtt(10);
+
+    let empty = ChunkSelectiveAck {
+        cumulative_tsn_ack: 0,
+        advertised_receiver_window_credit: 0,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+
+    a.on_rack_after_sack(now, None, 0, false, &empty);
+
+    assert_eq!(
+        Duration::from_millis(10),
+        a.rack_reo_wnd,
+        "reoWnd must be bounded by SRTT"
+    );
+}
+
+#[test]
 fn test_schedule_pto_uses_configured_single_packet_delayed_ack() {
     let now = Instant::now();
     let mut a = create_association(

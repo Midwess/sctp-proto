@@ -597,6 +597,82 @@ fn test_assoc_reliable_ordered_reordered() -> Result<()> {
 }
 
 #[test]
+fn test_assoc_rack_rtt_switch_reordering_no_spurious_loss() -> Result<()> {
+    const N_DELAYED: u32 = 4;
+    const N_MESSAGES: u32 = 14;
+    const MESSAGE_SIZE: usize = 256;
+    const SEND_STEP: Duration = Duration::from_millis(10);
+
+    let si: u16 = 4;
+    let mut sbuf = vec![0u8; MESSAGE_SIZE];
+    for (i, b) in sbuf.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    pair.client_conn_mut(client_ch).stats.reset();
+    pair.server_conn_mut(server_ch).stats.reset();
+
+    pair.latency = Duration::from_millis(150);
+    for i in 0..N_DELAYED {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        let n = pair.client_stream(client_ch, si)?.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )?;
+        assert_eq!(sbuf.len(), n, "unexpected length of transmitted data");
+        pair.client.drive(pair.time, pair.server.addr);
+        pair.time += SEND_STEP;
+    }
+
+    pair.latency = Duration::ZERO;
+    for i in N_DELAYED..N_MESSAGES {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        let n = pair.client_stream(client_ch, si)?.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )?;
+        assert_eq!(sbuf.len(), n, "unexpected length of transmitted data");
+        pair.client.drive(pair.time, pair.server.addr);
+        pair.time += SEND_STEP;
+    }
+
+    pair.drive_server();
+    pair.drive_client();
+    pair.drive();
+
+    let mut rbuf = vec![0u8; MESSAGE_SIZE];
+    for i in 0..N_MESSAGES {
+        let chunks = pair
+            .server_stream(server_ch, si)?
+            .read_sctp()?
+            .expect("expected ordered payload");
+        let (n, ppi) = (chunks.len(), chunks.ppi);
+        chunks.read(&mut rbuf)?;
+        assert_eq!(MESSAGE_SIZE, n, "unexpected length of received data");
+        assert_eq!(PayloadProtocolIdentifier::Binary, ppi, "unexpected ppi");
+        assert_eq!(
+            i,
+            u32::from_be_bytes([rbuf[0], rbuf[1], rbuf[2], rbuf[3]]),
+            "unexpected received ordering"
+        );
+    }
+
+    {
+        let a = pair.client_conn_mut(client_ch);
+        assert_eq!(0, a.stats.get_num_rack_loss_marks(), "should be no spurious RACK loss");
+        assert_eq!(0, a.stats.get_num_pto_timeouts(), "should not need PTO recovery");
+        assert_eq!(0, a.stats.get_num_t3timeouts(), "should not need T3 recovery");
+    }
+
+    close_association_pair(&mut pair, client_ch, server_ch, si);
+
+    Ok(())
+}
+
+#[test]
 fn test_assoc_reliable_ordered_fragmented_then_defragmented() -> Result<()> {
     //let _guard = subscribe();
 
