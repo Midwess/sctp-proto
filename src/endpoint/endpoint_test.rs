@@ -5,7 +5,7 @@ use std::println;
 
 use super::*;
 use crate::association::Event;
-use crate::config::generate_snap_token;
+use crate::config::{TransportConfigError, generate_snap_token};
 use crate::error::{Error, Result};
 
 use crate::association::state::{AckMode, AssociationState};
@@ -3840,5 +3840,92 @@ fn test_snap_association_drains_cleanly() {
     assert!(
         !endpoint.association_ids_init.contains_key(&remote_tag),
         "remote_tag should be removed from association_ids_init after drain"
+    );
+}
+
+#[test]
+fn test_connect_rejects_invalid_rack_min_rtt_window() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let config = ClientConfig {
+        transport: Arc::new(TransportConfig::default().with_rack_min_rtt_window(Duration::ZERO)),
+        ..ClientConfig::default()
+    };
+
+    let res = endpoint.connect(config, remote_addr);
+
+    assert!(matches!(
+        res,
+        Err(ConnectError::InvalidTransportConfig(
+            TransportConfigError::InvalidRackMinRttWindow
+        ))
+    ));
+}
+
+#[test]
+fn test_snap_connect_rejects_invalid_rack_delayed_ack() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+
+    let config = ClientConfig {
+        transport: Arc::new(
+            TransportConfig::default().with_rack_worst_case_delayed_ack(Duration::ZERO),
+        ),
+        ..ClientConfig::new().with_snap(local_init, remote_init)
+    };
+
+    let res = endpoint.connect(config, remote_addr);
+
+    assert!(matches!(
+        res,
+        Err(ConnectError::InvalidTransportConfig(
+            TransportConfigError::InvalidRackWorstCaseDelayedAck
+        ))
+    ));
+}
+
+#[test]
+fn test_server_rejects_incoming_init_with_invalid_rack_config() {
+    let now = Instant::now();
+    let mut endpoint = Endpoint::new(
+        Arc::new(EndpointConfig::default()),
+        Some(Arc::new(ServerConfig {
+            transport: Arc::new(
+                TransportConfig::default().with_rack_worst_case_delayed_ack(Duration::ZERO),
+            ),
+            ..ServerConfig::default()
+        })),
+    );
+
+    let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let init = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0x1122_3344,
+        ..Default::default()
+    };
+    let pkt = Packet {
+        common_header: CommonHeader {
+            source_port: 5000,
+            destination_port: 5000,
+            verification_tag: 0,
+        },
+        chunks: vec![Box::new(init)],
+    };
+
+    let res = endpoint
+        .handle(now, remote, None, None, pkt.marshal().expect("marshal init"));
+
+    assert!(res.is_none(), "incoming INIT should be refused");
+    assert!(endpoint.associations.is_empty(), "no association should be created");
+    assert!(
+        endpoint.association_ids.is_empty(),
+        "association_ids should stay empty"
+    );
+    assert!(
+        endpoint.association_ids_init.is_empty(),
+        "association_ids_init should stay empty"
     );
 }

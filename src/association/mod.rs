@@ -22,7 +22,10 @@ use crate::chunk::chunk_type::CT_FORWARD_TSN;
 use crate::config::COMMON_HEADER_SIZE;
 use crate::config::DATA_CHUNK_HEADER_SIZE;
 use crate::config::DEFAULT_SCTP_PORT;
-use crate::config::{ServerConfig, TransportConfig};
+use crate::config::{
+    DEFAULT_RACK_MIN_RTT_WINDOW, DEFAULT_RACK_REO_WND_FLOOR,
+    DEFAULT_RACK_WORST_CASE_DELAYED_ACK, ServerConfig, TransportConfig,
+};
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
 use crate::param::Param;
@@ -69,8 +72,6 @@ mod timer;
 #[cfg(test)]
 mod association_test;
 
-const RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
-const RACK_WC_DEL_ACK: Duration = Duration::from_millis(200);
 const RACK_PTO_EXTRA: Duration = Duration::from_millis(2);
 const TLR_UNITS_PER_MTU: i64 = 4;
 const TLR_BURST_DEFAULT_FIRST_RTT: i64 = 16;
@@ -265,8 +266,10 @@ pub struct Association {
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
     rack_min_rtt_wnd: WindowedMin,
+    rack_reo_wnd_floor: Duration,
     rack_reo_wnd: Duration,
     rack_min_rtt: Duration,
+    rack_wc_del_ack: Duration,
     rack_delivered_time: Option<Instant>,
     rack_highest_delivered_orig_tsn: u32,
     rack_reordering_seen: bool,
@@ -369,9 +372,11 @@ impl Default for Association {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
-            rack_min_rtt_wnd: WindowedMin::new(RACK_MIN_RTT_WINDOW),
+            rack_min_rtt_wnd: WindowedMin::new(DEFAULT_RACK_MIN_RTT_WINDOW),
+            rack_reo_wnd_floor: DEFAULT_RACK_REO_WND_FLOOR,
             rack_reo_wnd: Duration::ZERO,
             rack_min_rtt: Duration::ZERO,
+            rack_wc_del_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
             rack_delivered_time: None,
             rack_highest_delivered_orig_tsn: 0,
             rack_reordering_seen: false,
@@ -463,6 +468,9 @@ impl Association {
             payload_queue: ReceivePayloadQueue::from_max_receive_buffer_size(
                 config.max_receive_buffer_size(),
             ),
+            rack_min_rtt_wnd: WindowedMin::new(config.get_rack_min_rtt_window()),
+            rack_reo_wnd_floor: config.get_rack_reo_wnd_floor(),
+            rack_wc_del_ack: config.get_rack_worst_case_delayed_ack(),
             error: None,
 
             ..Default::default()
@@ -3223,7 +3231,7 @@ impl Association {
         }
 
         let extra = if self.inflight_queue.len() == 1 {
-            RACK_WC_DEL_ACK
+            self.rack_wc_del_ack
         } else {
             RACK_PTO_EXTRA
         };
@@ -3250,6 +3258,14 @@ impl Association {
         let dur = core::cmp::max(rack_rtt + self.rack_reo_wnd, Duration::from_millis(1));
         self.timers
             .start(Timer::Rack, now, Self::duration_to_millis(dur));
+    }
+
+    fn base_rack_reo_wnd(&self) -> Duration {
+        if self.rack_min_rtt > Duration::ZERO {
+            core::cmp::max(self.rack_min_rtt / 4, self.rack_reo_wnd_floor)
+        } else {
+            Duration::ZERO
+        }
     }
 
     fn on_rack_after_sack(
@@ -3283,11 +3299,7 @@ impl Association {
             self.rack_min_rtt = min_rtt;
         }
 
-        let base_reo_wnd = if self.rack_min_rtt > Duration::ZERO {
-            self.rack_min_rtt / 4
-        } else {
-            Duration::ZERO
-        };
+        let base_reo_wnd = self.base_rack_reo_wnd();
 
         if !self.rack_reordering_seen
             && (self.in_fast_recovery || self.timers.get(Timer::T3RTX).is_some())
@@ -3304,8 +3316,8 @@ impl Association {
 
         if !self.in_fast_recovery && self.rack_keep_inflated_recoveries > 0 {
             self.rack_keep_inflated_recoveries -= 1;
-            if self.rack_keep_inflated_recoveries == 0 && self.rack_min_rtt > Duration::ZERO {
-                self.rack_reo_wnd = self.rack_min_rtt / 4;
+            if self.rack_keep_inflated_recoveries == 0 && base_reo_wnd > Duration::ZERO {
+                self.rack_reo_wnd = base_reo_wnd;
             }
         }
 

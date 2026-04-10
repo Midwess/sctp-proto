@@ -14,7 +14,9 @@ use std::time::Instant;
 
 use crate::chunk::{chunk_init::ChunkInit, chunk_type::CT_INIT};
 use crate::config::MAX_SNAP_INIT_BYTES;
-use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
+use crate::config::{
+    ClientConfig, EndpointConfig, ServerConfig, TransportConfig, TransportConfigError,
+};
 use crate::packet::PartialDecode;
 use crate::shared::AssociationEvent;
 use crate::shared::{AssociationEventInner, AssociationId};
@@ -75,8 +77,6 @@ impl fmt::Debug for Endpoint {
 
 impl Endpoint {
     /// Create a new endpoint
-    ///
-    /// Returns `Err` if the configuration is invalid.
     pub fn new(config: Arc<EndpointConfig>, server_config: Option<Arc<ServerConfig>>) -> Self {
         let rng = {
             let mut base = rand::rng();
@@ -215,6 +215,10 @@ impl Endpoint {
         if remote.port() == 0 {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
+        config
+            .transport
+            .validate()
+            .map_err(ConnectError::InvalidTransportConfig)?;
 
         match (config.local_sctp_init, config.remote_sctp_init) {
             (Some(local_init), Some(remote_init)) => {
@@ -230,7 +234,7 @@ impl Endpoint {
                 let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
                 let local_aid = self.new_aid();
 
-                Ok(self.add_association(
+                self.add_association(
                     remote_aid,
                     local_aid,
                     remote,
@@ -238,7 +242,8 @@ impl Endpoint {
                     Instant::now(),
                     None,
                     config.transport,
-                ))
+                )
+                .map_err(ConnectError::InvalidTransportConfig)
             }
         }
     }
@@ -251,6 +256,10 @@ impl Endpoint {
         local_snap_bytes: Bytes,
         remote_snap_bytes: Bytes,
     ) -> Result<(AssociationHandle, Association), ConnectError> {
+        transport
+            .validate()
+            .map_err(ConnectError::InvalidTransportConfig)?;
+
         // Enforce a size ceiling on raw INIT bytes before parsing.
         if local_snap_bytes.len() > MAX_SNAP_INIT_BYTES {
             return Err(ConnectError::Snap(SnapError::OversizedInit {
@@ -434,7 +443,7 @@ impl Endpoint {
         let remote_aid = *partial_decode.initiate_tag.as_ref().unwrap();
         let local_aid = self.new_aid();
 
-        let (ch, mut conn) = self.add_association(
+        let (ch, mut conn) = match self.add_association(
             remote_aid,
             local_aid,
             remote,
@@ -442,7 +451,13 @@ impl Endpoint {
             now,
             Some(server_config),
             transport_config,
-        );
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("refusing association due to invalid transport config: {}", err);
+                return None;
+            }
+        };
 
         // Map the peer's INIT Initiate Tag so that retransmitted INITs (which use
         // verification_tag=0) can be routed to the association created for the first INIT.
@@ -471,7 +486,9 @@ impl Endpoint {
         now: Instant,
         server_config: Option<Arc<ServerConfig>>,
         transport_config: Arc<TransportConfig>,
-    ) -> (AssociationHandle, Association) {
+    ) -> Result<(AssociationHandle, Association), TransportConfigError> {
+        transport_config.validate()?;
+
         let conn = Association::new(
             server_config,
             transport_config,
@@ -492,7 +509,7 @@ impl Endpoint {
         let ch = AssociationHandle(id);
         self.association_ids.insert(local_aid, ch);
 
-        (ch, conn)
+        Ok((ch, conn))
     }
 
     /// Unconditionally reject future incoming associations
@@ -580,6 +597,9 @@ pub enum ConnectError {
     /// Examples include attempting to connect to port 0, or using an inappropriate address family.
     #[error("invalid remote address: {0}")]
     InvalidRemoteAddress(SocketAddr),
+    /// The supplied transport configuration was invalid.
+    #[error("invalid transport config: {0}")]
+    InvalidTransportConfig(#[from] TransportConfigError),
     /// No default client configuration was set up
     ///
     /// Use `Endpoint::connect_with` to specify a client configuration.

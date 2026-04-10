@@ -4,6 +4,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use bytes::Bytes;
 use core::fmt;
+use core::time::Duration;
+use thiserror::Error;
 
 /// MTU for inbound packet (from DTLS)
 pub(crate) const RECEIVE_MTU: usize = 8192;
@@ -21,6 +23,22 @@ pub(crate) const RTO_MAX: u64 = 60000;
 
 // Default max retransmit value (RFC 4960 Section 15)
 const DEFAULT_MAX_INIT_RETRANS: usize = 8;
+
+pub(crate) const DEFAULT_RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_RACK_REO_WND_FLOOR: Duration = Duration::ZERO;
+pub(crate) const DEFAULT_RACK_WORST_CASE_DELAYED_ACK: Duration = Duration::from_millis(200);
+
+/// Errors returned when a [`TransportConfig`] contains invalid values.
+#[non_exhaustive]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TransportConfigError {
+    /// RACK minimum RTT window must be strictly positive.
+    #[error("invalid RACK minimum RTT window: must be greater than zero")]
+    InvalidRackMinRttWindow,
+    /// RACK worst-case delayed ACK allowance must be strictly positive.
+    #[error("invalid RACK worst-case delayed ACK: must be greater than zero")]
+    InvalidRackWorstCaseDelayedAck,
+}
 
 /// Config collects the arguments to create_association construction into
 /// a single structure
@@ -59,6 +77,18 @@ pub struct TransportConfig {
     /// Maximum retransmission timeout in milliseconds.
     /// Default: 60000
     rto_max_ms: u64,
+
+    /// Window length used to track the minimum RTT for RACK.
+    /// Default: 30 seconds.
+    rack_min_rtt_window: Duration,
+
+    /// Floor applied to the derived RACK reordering window.
+    /// Default: 0.
+    rack_reo_wnd_floor: Duration,
+
+    /// Worst-case delayed-ACK allowance used for PTO when only one packet is in flight.
+    /// Default: 200 milliseconds.
+    rack_worst_case_delayed_ack: Duration,
 }
 
 impl Default for TransportConfig {
@@ -74,11 +104,26 @@ impl Default for TransportConfig {
             rto_initial_ms: RTO_INITIAL,
             rto_min_ms: RTO_MIN,
             rto_max_ms: RTO_MAX,
+            rack_min_rtt_window: DEFAULT_RACK_MIN_RTT_WINDOW,
+            rack_reo_wnd_floor: DEFAULT_RACK_REO_WND_FLOOR,
+            rack_worst_case_delayed_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
         }
     }
 }
 
 impl TransportConfig {
+    /// Validate configuration values that cannot be represented as type-level invariants.
+    pub fn validate(&self) -> Result<(), TransportConfigError> {
+        if self.rack_min_rtt_window.is_zero() {
+            return Err(TransportConfigError::InvalidRackMinRttWindow);
+        }
+        if self.rack_worst_case_delayed_ack.is_zero() {
+            return Err(TransportConfigError::InvalidRackWorstCaseDelayedAck);
+        }
+
+        Ok(())
+    }
+
     pub fn with_max_receive_buffer_size(mut self, value: u32) -> Self {
         self.max_receive_buffer_size = value;
         self
@@ -160,6 +205,24 @@ impl TransportConfig {
         self
     }
 
+    /// Set the window used to track the minimum RTT for RACK.
+    pub fn with_rack_min_rtt_window(mut self, value: Duration) -> Self {
+        self.rack_min_rtt_window = value;
+        self
+    }
+
+    /// Set the floor applied to the derived RACK reordering window.
+    pub fn with_rack_reo_wnd_floor(mut self, value: Duration) -> Self {
+        self.rack_reo_wnd_floor = value;
+        self
+    }
+
+    /// Set the worst-case delayed-ACK allowance used for single-packet PTO.
+    pub fn with_rack_worst_case_delayed_ack(mut self, value: Duration) -> Self {
+        self.rack_worst_case_delayed_ack = value;
+        self
+    }
+
     pub(crate) fn max_init_retransmits(&self) -> Option<usize> {
         self.max_init_retransmits
     }
@@ -178,6 +241,21 @@ impl TransportConfig {
 
     pub(crate) fn rto_max_ms(&self) -> u64 {
         self.rto_max_ms
+    }
+
+    /// Get the configured RACK minimum RTT window.
+    pub fn get_rack_min_rtt_window(&self) -> Duration {
+        self.rack_min_rtt_window
+    }
+
+    /// Get the configured RACK reordering-window floor.
+    pub fn get_rack_reo_wnd_floor(&self) -> Duration {
+        self.rack_reo_wnd_floor
+    }
+
+    /// Get the configured worst-case delayed-ACK allowance used for single-packet PTO.
+    pub fn get_rack_worst_case_delayed_ack(&self) -> Duration {
+        self.rack_worst_case_delayed_ack
     }
 }
 
@@ -399,4 +477,54 @@ pub fn generate_snap_token(config: &TransportConfig) -> Result<Bytes, crate::err
     init.set_supported_extensions();
     init.check()?;
     init.marshal()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_transport_config_rack_defaults() {
+        let config = TransportConfig::default();
+
+        assert_eq!(DEFAULT_RACK_MIN_RTT_WINDOW, config.get_rack_min_rtt_window());
+        assert_eq!(DEFAULT_RACK_REO_WND_FLOOR, config.get_rack_reo_wnd_floor());
+        assert_eq!(
+            DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
+            config.get_rack_worst_case_delayed_ack()
+        );
+        assert_eq!(Ok(()), config.validate());
+    }
+
+    #[test]
+    fn test_transport_config_rack_overrides() {
+        let config = TransportConfig::default()
+            .with_rack_min_rtt_window(Duration::from_secs(5))
+            .with_rack_reo_wnd_floor(Duration::from_millis(3))
+            .with_rack_worst_case_delayed_ack(Duration::from_millis(75));
+
+        assert_eq!(Duration::from_secs(5), config.get_rack_min_rtt_window());
+        assert_eq!(Duration::from_millis(3), config.get_rack_reo_wnd_floor());
+        assert_eq!(
+            Duration::from_millis(75),
+            config.get_rack_worst_case_delayed_ack()
+        );
+        assert_eq!(Ok(()), config.validate());
+    }
+
+    #[test]
+    fn test_transport_config_rack_validation() {
+        let invalid_min_rtt = TransportConfig::default().with_rack_min_rtt_window(Duration::ZERO);
+        assert_eq!(
+            Err(TransportConfigError::InvalidRackMinRttWindow),
+            invalid_min_rtt.validate()
+        );
+
+        let invalid_del_ack =
+            TransportConfig::default().with_rack_worst_case_delayed_ack(Duration::ZERO);
+        assert_eq!(
+            Err(TransportConfigError::InvalidRackWorstCaseDelayedAck),
+            invalid_del_ack.validate()
+        );
+    }
 }

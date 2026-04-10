@@ -411,6 +411,90 @@ fn test_handle_sack_marks_rack_loss_for_older_outstanding_chunk() -> Result<()> 
 }
 
 #[test]
+fn test_schedule_pto_uses_configured_single_packet_delayed_ack() {
+    let now = Instant::now();
+    let mut a = create_association(
+        TransportConfig::default().with_rack_worst_case_delayed_ack(Duration::from_millis(75)),
+    );
+    a.state = AssociationState::Established;
+    a.rto_mgr.set_new_rtt(100);
+
+    push_outstanding_chunk(&mut a, 10, now - Duration::from_millis(100), 100);
+
+    a.schedule_pto(now);
+
+    assert_eq!(
+        Some(now + Duration::from_millis(275)),
+        a.timers.get(Timer::Pto),
+        "single-packet PTO should use the configured delayed-ACK allowance"
+    );
+}
+
+#[test]
+fn test_on_rack_after_sack_respects_configured_rack_reo_wnd_floor() {
+    let now = Instant::now();
+    let mut a = create_association(
+        TransportConfig::default().with_rack_reo_wnd_floor(Duration::from_millis(50)),
+    );
+    a.state = AssociationState::Established;
+    a.mtu = 1200;
+    a.cwnd = 4800;
+    a.rwnd = 4800;
+    a.ssthresh = 4800;
+    a.cumulative_tsn_ack_point = 9;
+    a.rack_highest_delivered_orig_tsn = 9;
+
+    push_outstanding_chunk(&mut a, 10, now - Duration::from_millis(140), 100);
+    push_outstanding_chunk(&mut a, 11, now - Duration::from_millis(100), 100);
+
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 9,
+        advertised_receiver_window_credit: 4800,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+
+    a.on_rack_after_sack(now, Some(now - Duration::from_millis(100)), 11, true, &sack);
+
+    assert_eq!(Duration::from_millis(50), a.rack_reo_wnd);
+    assert!(
+        a.inflight_queue
+            .get(10)
+            .is_some_and(|chunk| !chunk.retransmit),
+        "configured reoWnd floor should suppress this spurious loss mark"
+    );
+    assert_eq!(0, a.stats.get_num_rack_loss_marks());
+}
+
+#[test]
+fn test_on_rack_after_sack_resets_inflated_reo_wnd_to_configured_floor() {
+    let now = Instant::now();
+    let mut a = create_association(
+        TransportConfig::default().with_rack_reo_wnd_floor(Duration::from_millis(50)),
+    );
+    a.state = AssociationState::Established;
+    a.rack_min_rtt = Duration::from_millis(100);
+    a.rack_reo_wnd = Duration::from_millis(200);
+    a.rack_keep_inflated_recoveries = 1;
+
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 0,
+        advertised_receiver_window_credit: 0,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+
+    a.on_rack_after_sack(now, None, 0, false, &sack);
+
+    assert_eq!(0, a.rack_keep_inflated_recoveries);
+    assert_eq!(
+        Duration::from_millis(50),
+        a.rack_reo_wnd,
+        "reoWnd reset should honor the configured floor"
+    );
+}
+
+#[test]
 fn test_on_pto_timeout_marks_latest_outstanding_chunk_for_probe() -> Result<()> {
     let now = Instant::now();
     let mut a = Association {

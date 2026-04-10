@@ -74,7 +74,7 @@ pub use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIden
 mod config;
 pub use crate::config::{
     ClientConfig, DEFAULT_SCTP_PORT, EndpointConfig, MAX_SNAP_INIT_BYTES, ServerConfig,
-    TransportConfig, generate_snap_token,
+    TransportConfig, TransportConfigError, generate_snap_token,
 };
 
 mod endpoint;
