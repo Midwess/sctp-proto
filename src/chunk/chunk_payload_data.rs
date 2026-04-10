@@ -100,7 +100,6 @@ pub struct ChunkPayloadData {
 
     /// Whether this data chunk was acknowledged (received by peer)
     pub(crate) acked: bool,
-    pub(crate) miss_indicator: u32,
 
     /// Partial-reliability parameters used only by sender
     pub(crate) since: Option<Instant>,
@@ -115,6 +114,10 @@ pub struct ChunkPayloadData {
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
+
+    pub(crate) rack_prev_tsn: Option<u32>,
+    pub(crate) rack_next_tsn: Option<u32>,
+    pub(crate) rack_in_list: bool,
 }
 
 impl Default for ChunkPayloadData {
@@ -130,12 +133,14 @@ impl Default for ChunkPayloadData {
             payload_type: PayloadProtocolIdentifier::default(),
             user_data: Bytes::new(),
             acked: false,
-            miss_indicator: 0,
             since: None,
             nsent: 0,
             abandoned: false,
             all_inflight: false,
             retransmit: false,
+            rack_prev_tsn: None,
+            rack_next_tsn: None,
+            rack_in_list: false,
         }
     }
 }
@@ -208,12 +213,14 @@ impl Chunk for ChunkPayloadData {
             user_data,
 
             acked: false,
-            miss_indicator: 0,
             since: None,
             nsent: 0,
             abandoned: false,
             all_inflight: false,
             retransmit: false,
+            rack_prev_tsn: None,
+            rack_next_tsn: None,
+            rack_in_list: false,
         })
     }
 

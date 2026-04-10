@@ -3,9 +3,10 @@ use crate::error::{Error, Result};
 use bytes::{Bytes, BytesMut};
 
 ///////////////////////////////////////////////////////////////////
-//payload_queue_test
+// payload_queue_test
 ///////////////////////////////////////////////////////////////////
-use super::payload_queue::*;
+use super::payload_queue::PayloadQueue;
+use super::receive_payload_queue::ReceivePayloadQueue;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::chunk::chunk_selective_ack::GapAckBlock;
 
@@ -36,7 +37,7 @@ fn test_payload_queue_push_no_check() -> Result<()> {
     assert_eq!(3, pq.len(), "item count mismatch");
 
     for i in 0..3 {
-        assert!(!pq.sorted.is_empty(), "should not be empty");
+        assert!(!pq.is_empty(), "should not be empty");
         let c = pq.pop(i);
         assert!(c.is_some(), "pop should succeed");
         if let Some(c) = c {
@@ -47,14 +48,14 @@ fn test_payload_queue_push_no_check() -> Result<()> {
     assert_eq!(0, pq.get_num_bytes(), "total bytes mismatch");
     assert_eq!(0, pq.len(), "item count mismatch");
 
-    assert!(pq.sorted.is_empty(), "should be empty");
+    assert!(pq.is_empty(), "should be empty");
     pq.push_no_check(make_payload(3, 13));
     assert_eq!(13, pq.get_num_bytes(), "total bytes mismatch");
     pq.push_no_check(make_payload(4, 14));
     assert_eq!(27, pq.get_num_bytes(), "total bytes mismatch");
 
     for i in 3..5 {
-        assert!(!pq.sorted.is_empty(), "should not be empty");
+        assert!(!pq.is_empty(), "should not be empty");
         let c = pq.pop(i);
         assert!(c.is_some(), "pop should succeed");
         if let Some(c) = c {
@@ -69,70 +70,15 @@ fn test_payload_queue_push_no_check() -> Result<()> {
 }
 
 #[test]
-fn test_payload_queue_get_gap_ack_block() -> Result<()> {
+fn test_payload_queue_pop_requires_front_tsn() -> Result<()> {
     let mut pq = PayloadQueue::new();
+    pq.push_no_check(make_payload(20, 10));
+    pq.push_no_check(make_payload(21, 11));
+    pq.push_no_check(make_payload(22, 12));
 
-    pq.push(make_payload(1, 0), 0);
-    pq.push(make_payload(2, 0), 0);
-    pq.push(make_payload(3, 0), 0);
-    pq.push(make_payload(4, 0), 0);
-    pq.push(make_payload(5, 0), 0);
-    pq.push(make_payload(6, 0), 0);
-
-    let gab1 = [GapAckBlock { start: 1, end: 6 }];
-    let gab2 = pq.get_gap_ack_blocks(0);
-    assert!(!gab2.is_empty());
-    assert_eq!(gab2.len(), 1);
-
-    assert_eq!(gab1[0].start, gab2[0].start);
-    assert_eq!(gab1[0].end, gab2[0].end);
-
-    pq.push(make_payload(8, 0), 0);
-    pq.push(make_payload(9, 0), 0);
-
-    let gab1 = [
-        GapAckBlock { start: 1, end: 6 },
-        GapAckBlock { start: 8, end: 9 },
-    ];
-    let gab2 = pq.get_gap_ack_blocks(0);
-    assert!(!gab2.is_empty());
-    assert_eq!(gab2.len(), 2);
-
-    assert_eq!(gab1[0].start, gab2[0].start);
-    assert_eq!(gab1[0].end, gab2[0].end);
-    assert_eq!(gab1[1].start, gab2[1].start);
-    assert_eq!(gab1[1].end, gab2[1].end);
-
-    Ok(())
-}
-
-#[test]
-fn test_payload_queue_get_last_tsn_received() -> Result<()> {
-    let mut pq = PayloadQueue::new();
-
-    // empty queie should return false
-    let ok = pq.get_last_tsn_received();
-    assert!(ok.is_none(), "should be none");
-
-    let ok = pq.push(make_payload(20, 0), 0);
-    assert!(ok, "should be true");
-    let tsn = pq.get_last_tsn_received();
-    assert!(tsn.is_some(), "should be false");
-    assert_eq!(Some(&20), tsn, "should match");
-
-    // append should work
-    let ok = pq.push(make_payload(21, 0), 0);
-    assert!(ok, "should be true");
-    let tsn = pq.get_last_tsn_received();
-    assert!(tsn.is_some(), "should be false");
-    assert_eq!(Some(&21), tsn, "should match");
-
-    // check if sorting applied
-    let ok = pq.push(make_payload(19, 0), 0);
-    assert!(ok, "should be true");
-    let tsn = pq.get_last_tsn_received();
-    assert!(tsn.is_some(), "should be false");
-    assert_eq!(Some(&21), tsn, "should match");
+    assert!(pq.pop(21).is_none(), "non-front pop should fail");
+    assert_eq!(33, pq.get_num_bytes(), "bytes should stay intact");
+    assert_eq!(Some(22), pq.last_tsn(), "tail TSN should stay intact");
 
     Ok(())
 }
@@ -142,7 +88,7 @@ fn test_payload_queue_mark_all_to_retrasmit() -> Result<()> {
     let mut pq = PayloadQueue::new();
 
     for i in 0..3 {
-        pq.push(make_payload(i + 1, 10), 0);
+        pq.push_no_check(make_payload(i + 1, 10));
     }
     pq.mark_as_acked(2);
     pq.mark_all_to_retrasmit();
@@ -165,7 +111,7 @@ fn test_payload_queue_reset_retransmit_flag_on_ack() -> Result<()> {
     let mut pq = PayloadQueue::new();
 
     for i in 0..4 {
-        pq.push(make_payload(i + 1, 10), 0);
+        pq.push_no_check(make_payload(i + 1, 10));
     }
 
     pq.mark_all_to_retrasmit();
@@ -184,6 +130,82 @@ fn test_payload_queue_reset_retransmit_flag_on_ack() -> Result<()> {
     let c = pq.get(4);
     assert!(c.is_some(), "should be true");
     assert!(!c.unwrap().retransmit, "should NOT be marked as retransmit");
+
+    Ok(())
+}
+
+#[test]
+fn test_receive_payload_queue_get_gap_ack_block() -> Result<()> {
+    let mut pq = ReceivePayloadQueue::new(64);
+    pq.init(0);
+
+    for tsn in 1..=6 {
+        assert!(pq.push(make_payload(tsn, 0)), "push should succeed");
+    }
+
+    let gab1 = [GapAckBlock { start: 1, end: 6 }];
+    let gab2 = pq.get_gap_ack_blocks();
+    assert!(!gab2.is_empty());
+    assert_eq!(gab2.len(), 1);
+
+    assert_eq!(gab1[0].start, gab2[0].start);
+    assert_eq!(gab1[0].end, gab2[0].end);
+
+    assert!(pq.push(make_payload(8, 0)), "push should succeed");
+    assert!(pq.push(make_payload(9, 0)), "push should succeed");
+
+    let gab1 = [
+        GapAckBlock { start: 1, end: 6 },
+        GapAckBlock { start: 8, end: 9 },
+    ];
+    let gab2 = pq.get_gap_ack_blocks();
+    assert!(!gab2.is_empty());
+    assert_eq!(gab2.len(), 2);
+
+    assert_eq!(gab1[0].start, gab2[0].start);
+    assert_eq!(gab1[0].end, gab2[0].end);
+    assert_eq!(gab1[1].start, gab2[1].start);
+    assert_eq!(gab1[1].end, gab2[1].end);
+
+    Ok(())
+}
+
+#[test]
+fn test_receive_payload_queue_get_last_tsn_received() -> Result<()> {
+    let mut pq = ReceivePayloadQueue::new(64);
+    pq.init(18);
+
+    assert!(pq.get_last_tsn_received().is_none(), "should be none");
+
+    assert!(pq.push(make_payload(20, 0)), "should be true");
+    assert_eq!(Some(&20), pq.get_last_tsn_received(), "should match");
+
+    assert!(pq.push(make_payload(21, 0)), "should be true");
+    assert_eq!(Some(&21), pq.get_last_tsn_received(), "should match");
+
+    assert!(pq.push(make_payload(19, 0)), "should be true");
+    assert_eq!(Some(&21), pq.get_last_tsn_received(), "should match");
+
+    Ok(())
+}
+
+#[test]
+fn test_receive_payload_queue_duplicate_and_force_pop() -> Result<()> {
+    let mut pq = ReceivePayloadQueue::new(64);
+    pq.init(10);
+
+    assert!(pq.push(make_payload(12, 0)), "first push should succeed");
+    assert!(!pq.push(make_payload(12, 0)), "duplicate push should fail");
+    assert_eq!(vec![12], pq.pop_duplicates(), "duplicate TSN should be recorded");
+
+    assert!(!pq.pop(false), "missing next TSN should not advance without force");
+    assert_eq!(10, pq.cumulative_tsn(), "cumulative TSN should stay unchanged");
+
+    assert!(!pq.pop(true), "forced pop should skip the missing TSN");
+    assert_eq!(11, pq.cumulative_tsn(), "cumulative TSN should advance");
+
+    assert!(pq.pop(false), "queued TSN should now advance cumulatively");
+    assert_eq!(12, pq.cumulative_tsn(), "cumulative TSN should advance");
 
     Ok(())
 }

@@ -1404,11 +1404,11 @@ fn test_assoc_unreliable_rexmit_timed_unordered() -> Result<()> {
 
 /*FIXME
 // 1) Send 4 packets. drop the first one.
-// 2) Last 3 packet will be received, which triggers fast-retransmission
+// 2) Last 3 packet will be received, which triggers RACK-based loss detection
 // 3) The first one is retransmitted, which makes s1 readable
-// Above should be done before RTO occurs (fast recovery)
+// Above should be done before RTO occurs (loss recovery)
 #[test]
-fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
+fn test_assoc_congestion_control_rack_loss_recovery() -> Result<()> {
     let _guard = subscribe();
 
     let si: u16 = 6;
@@ -1437,7 +1437,7 @@ fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
         }
     }
 
-    // process packets for 500 msec, assuming that the fast retrans/recover
+    // process packets for 500 msec, assuming that the RACK loss/recovery
     // should complete within 500 msec.
     /*for _ in 0..50 {
         br.tick().await;
@@ -1480,9 +1480,9 @@ fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
         let a = pair.client_conn_mut(client_ch);
         assert!(!a.in_fast_recovery, "should not be in fast-recovery");
         debug!("nSACKs      : {}", a.stats.get_num_sacks());
-        debug!("nFastRetrans: {}", a.stats.get_num_fast_retrans());
+        debug!("nRackLosses : {}", a.stats.get_num_rack_loss_marks());
 
-        assert_eq!(1, a.stats.get_num_fast_retrans(), "should be 1");
+        assert_eq!(1, a.stats.get_num_rack_loss_marks(), "should be 1");
     }
     {
         let b = pair.server_conn_mut(server_ch);

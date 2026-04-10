@@ -31,8 +31,12 @@ use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
 use crate::param::param_state_cookie::ParamStateCookie;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
-use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
+use crate::queue::{
+    payload_queue::PayloadQueue, pending_queue::PendingQueue,
+    receive_payload_queue::ReceivePayloadQueue,
+};
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
+use crate::util::get_padding_size;
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
@@ -64,6 +68,52 @@ mod timer;
 
 #[cfg(test)]
 mod association_test;
+
+const RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
+const RACK_WC_DEL_ACK: Duration = Duration::from_millis(200);
+const RACK_PTO_EXTRA: Duration = Duration::from_millis(2);
+
+#[derive(Debug, Clone)]
+struct WindowedMin {
+    window: Duration,
+    deque: VecDeque<(Instant, Duration)>,
+}
+
+impl WindowedMin {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            deque: VecDeque::new(),
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some((t, _)) = self.deque.front() {
+            if now.duration_since(*t) > self.window {
+                self.deque.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn push(&mut self, now: Instant, value: Duration) {
+        self.prune(now);
+        while self
+            .deque
+            .back()
+            .is_some_and(|(_, current)| *current >= value)
+        {
+            self.deque.pop_back();
+        }
+        self.deque.push_back((now, value));
+    }
+
+    fn min(&mut self, now: Instant) -> Option<Duration> {
+        self.prune(now);
+        self.deque.front().map(|(_, value)| *value)
+    }
+}
 
 /// Reasons why an association might be lost
 #[non_exhaustive]
@@ -159,7 +209,6 @@ pub struct Association {
     // for RTT measurement
     min_tsn2measure_rtt: u32,
     will_send_forward_tsn: bool,
-    will_retransmit_fast: bool,
     will_retransmit_reconfig: bool,
 
     will_send_shutdown_ack: bool,
@@ -180,7 +229,7 @@ pub struct Association {
     my_max_num_outbound_streams: u16,
     my_cookie: Option<ParamStateCookie>,
 
-    payload_queue: PayloadQueue,
+    payload_queue: ReceivePayloadQueue,
     inflight_queue: PayloadQueue,
     pending_queue: PendingQueue,
     control_queue: VecDeque<Packet>,
@@ -207,6 +256,15 @@ pub struct Association {
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
+    rack_min_rtt_wnd: WindowedMin,
+    rack_reo_wnd: Duration,
+    rack_min_rtt: Duration,
+    rack_delivered_time: Option<Instant>,
+    rack_highest_delivered_orig_tsn: u32,
+    rack_reordering_seen: bool,
+    rack_keep_inflated_recoveries: u8,
+    rack_head_tsn: Option<u32>,
+    rack_tail_tsn: Option<u32>,
 
     // Chunks stored for retransmission
     stored_init: Option<ChunkInit>,
@@ -248,7 +306,6 @@ impl Default for Association {
             // for RTT measurement
             min_tsn2measure_rtt: 0,
             will_send_forward_tsn: false,
-            will_retransmit_fast: false,
             will_retransmit_reconfig: false,
 
             will_send_shutdown_ack: false,
@@ -269,7 +326,7 @@ impl Default for Association {
             my_max_num_outbound_streams: 0,
             my_cookie: None,
 
-            payload_queue: PayloadQueue::default(),
+            payload_queue: ReceivePayloadQueue::default(),
             inflight_queue: PayloadQueue::default(),
             pending_queue: PendingQueue::default(),
             control_queue: VecDeque::default(),
@@ -296,6 +353,15 @@ impl Default for Association {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+            rack_min_rtt_wnd: WindowedMin::new(RACK_MIN_RTT_WINDOW),
+            rack_reo_wnd: Duration::ZERO,
+            rack_min_rtt: Duration::ZERO,
+            rack_delivered_time: None,
+            rack_highest_delivered_orig_tsn: 0,
+            rack_reordering_seen: false,
+            rack_keep_inflated_recoveries: 0,
+            rack_head_tsn: None,
+            rack_tail_tsn: None,
 
             // Chunks stored for retransmission
             stored_init: None,
@@ -370,6 +436,9 @@ impl Association {
             min_tsn2measure_rtt: initial_tsn,
             cumulative_tsn_ack_point: initial_tsn.wrapping_sub(1),
             advanced_peer_tsn_ack_point: initial_tsn.wrapping_sub(1),
+            payload_queue: ReceivePayloadQueue::from_max_receive_buffer_size(
+                config.max_receive_buffer_size(),
+            ),
             error: None,
 
             ..Default::default()
@@ -605,6 +674,10 @@ impl Association {
 
             if timer == Timer::Ack {
                 self.on_ack_timeout();
+            } else if timer == Timer::Rack {
+                self.on_rack_timeout(now);
+            } else if timer == Timer::Pto {
+                self.on_pto_timeout(now);
             } else if failure {
                 self.on_retransmission_failure(timer);
             } else {
@@ -783,9 +856,14 @@ impl Association {
                 self.stats.get_num_ack_timeouts()
             );
             debug!(
-                "[{}] stats nFastRetrans: {}",
+                "[{}] stats nRackLossMarks: {}",
                 self.side,
-                self.stats.get_num_fast_retrans()
+                self.stats.get_num_rack_loss_marks()
+            );
+            debug!(
+                "[{}] stats nPtoTimeouts : {}",
+                self.side,
+                self.stats.get_num_pto_timeouts()
             );
         }
 
@@ -937,6 +1015,7 @@ impl Association {
     ) {
         // RFC 4960 §13.2: peer_last_tsn is the peer's initial TSN minus one.
         self.peer_last_tsn = initial_tsn.wrapping_sub(1);
+        self.payload_queue.init(self.peer_last_tsn);
 
         self.rwnd = advertised_receiver_window_credit;
         debug!("[{}] initial rwnd={}", self.side, self.rwnd);
@@ -1354,7 +1433,7 @@ impl Association {
         );
         self.stats.inc_datas();
 
-        let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
+        let can_push = self.payload_queue.can_push(d);
         let mut stream_handle_data = false;
         if can_push {
             if self.get_or_create_stream(d.stream_identifier).is_some() {
@@ -1393,7 +1472,7 @@ impl Association {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
                 let queued = s.handle_data(d)?;
                 // Only commit to payload_queue after reassembly accepts the chunk
-                self.payload_queue.push(d.clone(), self.peer_last_tsn);
+                self.payload_queue.push(d.clone());
                 self.events.push_back(Event::DatagramReceived);
                 if queued && s.reassembly_queue.is_readable() {
                     self.events.push_back(Event::Stream(StreamEvent::Readable {
@@ -1442,7 +1521,13 @@ impl Association {
         }
 
         // Process selective ack
-        let (bytes_acked_per_stream, htna) = self.process_selective_ack(d, now)?;
+        let (
+            bytes_acked_per_stream,
+            _htna,
+            newest_delivered_send_time,
+            newest_delivered_orig_tsn,
+            delivered_found,
+        ) = self.process_selective_ack(d, now)?;
 
         let mut total_bytes_acked = 0;
         for n_bytes_acked in bytes_acked_per_stream.values() {
@@ -1459,6 +1544,12 @@ impl Association {
             self.cumulative_tsn_ack_point = d.cumulative_tsn_ack;
             cum_tsn_ack_point_advanced = true;
             self.on_cumulative_tsn_ack_point_advanced(total_bytes_acked, now);
+            if self.in_fast_recovery
+                && sna32gte(self.cumulative_tsn_ack_point, self.fast_recover_exit_point)
+            {
+                debug!("[{}] exit fast-recovery", self.side);
+                self.in_fast_recovery = false;
+            }
         }
 
         for (si, n_bytes_acked) in &bytes_acked_per_stream {
@@ -1484,8 +1575,6 @@ impl Association {
         } else {
             self.rwnd = d.advertised_receiver_window_credit - bytes_outstanding;
         }
-
-        self.process_fast_retransmission(d.cumulative_tsn_ack, htna, cum_tsn_ack_point_advanced)?;
 
         if self.use_forward_tsn {
             // RFC 3758 Sec 3.5 C1
@@ -1524,6 +1613,13 @@ impl Association {
         }
 
         self.postprocess_sack(state, cum_tsn_ack_point_advanced, now);
+        self.on_rack_after_sack(
+            now,
+            newest_delivered_send_time,
+            newest_delivered_orig_tsn,
+            delivered_found,
+            d,
+        );
 
         Ok(vec![])
     }
@@ -1597,7 +1693,7 @@ impl Association {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1); // may not exist
+            self.payload_queue.pop(true);
             self.peer_last_tsn += 1;
         }
 
@@ -1654,7 +1750,7 @@ impl Association {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1);
+            self.payload_queue.pop(true);
             self.peer_last_tsn += 1;
         }
 
@@ -1742,7 +1838,7 @@ impl Association {
         // Meaning, if peer_last_tsn+1 points to a chunk that is received,
         // advance peer_last_tsn until peer_last_tsn+1 points to unreceived chunk.
         //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
-        while self.payload_queue.pop(self.peer_last_tsn + 1).is_some() {
+        while self.payload_queue.pop(false) {
             self.peer_last_tsn += 1;
             //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
 
@@ -1763,7 +1859,7 @@ impl Association {
                 "[{}] packetloss: {}",
                 self.side,
                 self.payload_queue
-                    .get_gap_ack_blocks_string(self.peer_last_tsn)
+                    .get_gap_ack_blocks_string()
             );
         }
 
@@ -1837,8 +1933,11 @@ impl Association {
         &mut self,
         d: &ChunkSelectiveAck,
         now: Instant,
-    ) -> Result<(HashMap<u16, i64>, u32)> {
+    ) -> Result<(HashMap<u16, i64>, u32, Option<Instant>, u32, bool)> {
         let mut bytes_acked_per_stream = HashMap::new();
+        let mut newest_delivered_send_time = None;
+        let mut newest_delivered_orig_tsn = 0;
+        let mut delivered_found = false;
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -1846,6 +1945,7 @@ impl Association {
         let mut i = self.cumulative_tsn_ack_point + 1;
         //log::debug!("[{}] i={} d={}", self.name, i, d.cumulative_tsn_ack);
         while sna32lte(i, d.cumulative_tsn_ack) {
+            self.rack_remove(i);
             if let Some(c) = self.inflight_queue.pop(i) {
                 if !c.acked {
                     // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
@@ -1892,11 +1992,13 @@ impl Association {
                             error!("[{}] invalid c.since", self.side);
                         }
                     }
-                }
 
-                if self.in_fast_recovery && c.tsn == self.fast_recover_exit_point {
-                    debug!("[{}] exit fast-recovery", self.side);
-                    self.in_fast_recovery = false;
+                    if c.since.is_some_and(|since| newest_delivered_send_time.is_none_or(|curr| since > curr))
+                    {
+                        newest_delivered_send_time = c.since;
+                        newest_delivered_orig_tsn = c.tsn;
+                        delivered_found = true;
+                    }
                 }
             } else {
                 return Err(Error::ErrInflightQueueTsnPop);
@@ -1918,6 +2020,7 @@ impl Association {
                     (false, false)
                 };
                 let n_bytes_acked = if is_existed && !is_acked {
+                    self.rack_remove(tsn);
                     self.inflight_queue.mark_as_acked(tsn) as i64
                 } else {
                     0
@@ -1946,12 +2049,19 @@ impl Association {
                                     srtt,
                                     self.rto_mgr.get_rto()
                                 );
-                            } else {
-                                error!("[{}] invalid c.since", self.side);
-                            }
+                        } else {
+                            error!("[{}] invalid c.since", self.side);
                         }
 
-                        if sna32lt(htna, tsn) {
+                        if c.since.is_some_and(|since| newest_delivered_send_time.is_none_or(|curr| since > curr))
+                        {
+                            newest_delivered_send_time = c.since;
+                            newest_delivered_orig_tsn = c.tsn;
+                            delivered_found = true;
+                        }
+                    }
+
+                    if sna32lt(htna, tsn) {
                             htna = tsn;
                         }
                     }
@@ -1961,7 +2071,13 @@ impl Association {
             }
         }
 
-        Ok((bytes_acked_per_stream, htna))
+        Ok((
+            bytes_acked_per_stream,
+            htna,
+            newest_delivered_send_time,
+            newest_delivered_orig_tsn,
+            delivered_found,
+        ))
     }
 
     fn on_cumulative_tsn_ack_point_advanced(&mut self, total_bytes_acked: i64, now: Instant) {
@@ -1975,6 +2091,8 @@ impl Association {
                 self.pending_queue.len()
             );
             self.timers.stop(Timer::T3RTX);
+            self.timers.stop(Timer::Rack);
+            self.timers.stop(Timer::Pto);
         } else {
             trace!("[{}] T3-rtx timer start (pt2)", self.side);
             self.timers
@@ -2035,70 +2153,6 @@ impl Association {
                 );
             }
         }
-    }
-
-    fn process_fast_retransmission(
-        &mut self,
-        cum_tsn_ack_point: u32,
-        htna: u32,
-        cum_tsn_ack_point_advanced: bool,
-    ) -> Result<()> {
-        // HTNA algorithm - RFC 4960 Sec 7.2.4
-        // Increment missIndicator of each chunks that the SACK reported missing
-        // when either of the following is met:
-        // a)  Not in fast-recovery
-        //     miss indications are incremented only for missing TSNs prior to the
-        //     highest TSN newly acknowledged in the SACK.
-        // b)  In fast-recovery AND the Cumulative TSN Ack Point advanced
-        //     the miss indications are incremented for all TSNs reported missing
-        //     in the SACK.
-        if !self.in_fast_recovery || cum_tsn_ack_point_advanced {
-            let max_tsn = if !self.in_fast_recovery {
-                // a) increment only for missing TSNs prior to the HTNA
-                htna
-            } else {
-                // b) increment for all TSNs reported missing
-                cum_tsn_ack_point + (self.inflight_queue.len() as u32) + 1
-            };
-
-            let mut tsn = cum_tsn_ack_point + 1;
-            while sna32lt(tsn, max_tsn) {
-                if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if !c.acked && !c.abandoned() && c.miss_indicator < 3 {
-                        c.miss_indicator += 1;
-                        if c.miss_indicator == 3 && !self.in_fast_recovery {
-                            // 2)  If not in Fast Recovery, adjust the ssthresh and cwnd of the
-                            //     destination address(es) to which the missing DATA chunks were
-                            //     last sent, according to the formula described in Section 7.2.3.
-                            self.in_fast_recovery = true;
-                            self.fast_recover_exit_point = htna;
-                            self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
-                            self.cwnd = self.ssthresh;
-                            self.partial_bytes_acked = 0;
-                            self.will_retransmit_fast = true;
-
-                            trace!(
-                                "[{}] updated cwnd={} ssthresh={} inflight={} (FR)",
-                                self.side,
-                                self.cwnd,
-                                self.ssthresh,
-                                self.inflight_queue.get_num_bytes()
-                            );
-                        }
-                    }
-                } else {
-                    return Err(Error::ErrTsnRequestNotExist);
-                }
-
-                tsn += 1;
-            }
-        }
-
-        if self.in_fast_recovery && cum_tsn_ack_point_advanced {
-            self.will_retransmit_fast = true;
-        }
-
-        Ok(())
     }
 
     /// The caller must hold the lock. This method was only added because the
@@ -2290,7 +2344,6 @@ impl Association {
             AssociationState::Established => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
                 raw_packets = self.gather_outbound_data_and_reconfig_packets(raw_packets, now);
-                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)
@@ -2299,7 +2352,6 @@ impl Association {
             | AssociationState::ShutdownSent
             | AssociationState::ShutdownReceived => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
-                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 self.gather_outbound_shutdown_packets(raw_packets, now)
             }
@@ -2342,6 +2394,7 @@ impl Association {
             trace!("[{}] T3-rtx timer start (pt1)", self.side);
             self.timers
                 .restart_if_stale(Timer::T3RTX, now, self.rto_mgr.get_rto());
+            self.schedule_pto(now);
 
             for p in &self.bundle_data_chunks_into_packets(chunks) {
                 if let Ok(raw) = p.marshal() {
@@ -2419,80 +2472,6 @@ impl Association {
         if !self.reconfigs.is_empty() {
             self.timers
                 .restart_if_stale(Timer::Reconfig, now, self.rto_mgr.get_rto());
-        }
-
-        raw_packets
-    }
-
-    fn gather_outbound_fast_retransmission_packets(
-        &mut self,
-        mut raw_packets: Vec<Bytes>,
-        now: Instant,
-    ) -> Vec<Bytes> {
-        if self.will_retransmit_fast {
-            self.will_retransmit_fast = false;
-
-            let mut to_fast_retrans: Vec<Box<dyn Chunk + Send + Sync>> = vec![];
-            let mut fast_retrans_size = COMMON_HEADER_SIZE;
-
-            let mut i = 0;
-            loop {
-                let tsn = self.cumulative_tsn_ack_point + i + 1;
-                if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if c.acked || c.abandoned() || c.nsent > 1 || c.miss_indicator < 3 {
-                        i += 1;
-                        continue;
-                    }
-
-                    // RFC 4960 Sec 7.2.4 Fast Retransmit on Gap Reports
-                    //  3)  Determine how many of the earliest (i.e., lowest TSN) DATA chunks
-                    //      marked for retransmission will fit into a single packet, subject
-                    //      to constraint of the path MTU of the destination transport
-                    //      address to which the packet is being sent.  Call this value K.
-                    //      Retransmit those K DATA chunks in a single packet.  When a Fast
-                    //      Retransmit is being performed, the sender SHOULD ignore the value
-                    //      of cwnd and SHOULD NOT delay retransmission for this single
-                    //		packet.
-
-                    let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
-                    if self.mtu < fast_retrans_size + data_chunk_size {
-                        break;
-                    }
-
-                    fast_retrans_size += data_chunk_size;
-                    self.stats.inc_fast_retrans();
-                    c.nsent += 1;
-                } else {
-                    break; // end of pending data
-                }
-
-                if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    Association::check_partial_reliability_status(
-                        c,
-                        now,
-                        self.use_forward_tsn,
-                        self.side,
-                        &self.streams,
-                    );
-                    to_fast_retrans.push(Box::new(c.clone()));
-                    trace!(
-                        "[{}] fast-retransmit: tsn={} sent={} htna={}",
-                        self.side, c.tsn, c.nsent, self.fast_recover_exit_point
-                    );
-                }
-                i += 1;
-            }
-
-            if !to_fast_retrans.is_empty() {
-                if let Ok(raw) = self.create_packet(to_fast_retrans).marshal() {
-                    raw_packets.push(raw);
-                } else {
-                    warn!(
-                        "[{}] failed to serialize a DATA packet to be fast-retransmitted",
-                        self.side
-                    );
-                }
-            }
         }
 
         raw_packets
@@ -2599,34 +2578,58 @@ impl Association {
         let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
-        let mut done = false;
+        let mut bytes_in_packet = 0usize;
         let mut i = 0;
-        while !done {
+        loop {
             let tsn = self.cumulative_tsn_ack_point + i + 1;
-            if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                if !c.retransmit {
-                    i += 1;
+            let Some(existing) = self.inflight_queue.get(tsn) else {
+                break; // end of pending data
+            };
+
+            if !existing.retransmit {
+                i += 1;
+                continue;
+            }
+
+            let data_len = existing.user_data.len();
+            if i == 0 && self.rwnd < data_len as u32 {
+                // zero-window probe for the first outstanding retransmission
+            } else if bytes_to_send + data_len > awnd as usize {
+                break;
+            }
+
+            let mut chunk_bytes = DATA_CHUNK_HEADER_SIZE as usize + data_len;
+            chunk_bytes += get_padding_size(chunk_bytes);
+
+            loop {
+                let add_bytes = if bytes_in_packet == 0 {
+                    COMMON_HEADER_SIZE as usize + chunk_bytes
+                } else {
+                    chunk_bytes
+                };
+
+                if bytes_in_packet == 0 && add_bytes > self.mtu as usize {
+                    return self.bundle_data_chunks_into_packets(chunks);
+                }
+
+                if bytes_in_packet > 0 && bytes_in_packet + chunk_bytes > self.mtu as usize {
+                    bytes_in_packet = 0;
                     continue;
                 }
 
-                if i == 0 && self.rwnd < c.user_data.len() as u32 {
-                    // Send it as a zero window probe
-                    done = true;
-                } else if bytes_to_send + c.user_data.len() > awnd as usize {
-                    break;
+                if bytes_in_packet == 0 {
+                    bytes_in_packet = COMMON_HEADER_SIZE as usize;
                 }
-
-                // reset the retransmit flag not to retransmit again before the next
-                // t3-rtx timer fires
-                c.retransmit = false;
-                bytes_to_send += c.user_data.len();
-
-                c.nsent += 1;
-            } else {
-                break; // end of pending data
+                bytes_in_packet += chunk_bytes;
+                break;
             }
 
+            self.rack_remove(tsn);
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                c.retransmit = false;
+                bytes_to_send += c.user_data.len();
+                c.nsent += 1;
+                c.since = Some(now);
                 Association::check_partial_reliability_status(
                     c,
                     now,
@@ -2639,10 +2642,14 @@ impl Association {
                     "[{}] retransmitting tsn={} ssn={} sent={}",
                     self.side, c.tsn, c.stream_sequence_number, c.nsent
                 );
-
                 chunks.push(c.clone());
             }
+            self.rack_insert(tsn);
             i += 1;
+        }
+
+        if !chunks.is_empty() {
+            self.schedule_pto(now);
         }
 
         self.bundle_data_chunks_into_packets(chunks)
@@ -2656,6 +2663,7 @@ impl Association {
     ) -> (Vec<ChunkPayloadData>, Vec<u16>) {
         let mut chunks = vec![];
         let mut sis_to_reset = vec![]; // stream identifiers to reset
+        let mut bytes_in_packet = 0usize;
         if !self.pending_queue.is_empty() {
             // RFC 4960 sec 6.1.  Transmission of DATA Chunks
             //   A) At any given time, the data sender MUST NOT transmit new data to
@@ -2693,6 +2701,18 @@ impl Association {
                     break; // no more rwnd
                 }
 
+                let mut chunk_bytes = DATA_CHUNK_HEADER_SIZE as usize + data_len;
+                chunk_bytes += get_padding_size(chunk_bytes);
+                if bytes_in_packet == 0 {
+                    if COMMON_HEADER_SIZE as usize + chunk_bytes > self.mtu as usize {
+                        break;
+                    }
+                    bytes_in_packet = COMMON_HEADER_SIZE as usize;
+                } else if bytes_in_packet + chunk_bytes > self.mtu as usize {
+                    bytes_in_packet = 0;
+                    continue;
+                }
+
                 self.rwnd -= data_len as u32;
 
                 if let Some(chunk) = self.move_pending_data_chunk_to_inflight_queue(
@@ -2701,6 +2721,7 @@ impl Association {
                     now,
                 ) {
                     chunks.push(chunk);
+                    bytes_in_packet += chunk_bytes;
                 }
             }
 
@@ -2709,13 +2730,17 @@ impl Association {
                 // Send zero window probe
                 if let Some(c) = self.pending_queue.peek() {
                     let (beginning_fragment, unordered) = (c.beginning_fragment, c.unordered);
+                    let mut chunk_bytes = DATA_CHUNK_HEADER_SIZE as usize + c.user_data.len();
+                    chunk_bytes += get_padding_size(chunk_bytes);
 
-                    if let Some(chunk) = self.move_pending_data_chunk_to_inflight_queue(
-                        beginning_fragment,
-                        unordered,
-                        now,
-                    ) {
-                        chunks.push(chunk);
+                    if COMMON_HEADER_SIZE as usize + chunk_bytes <= self.mtu as usize {
+                        if let Some(chunk) = self.move_pending_data_chunk_to_inflight_queue(
+                            beginning_fragment,
+                            unordered,
+                            now,
+                        ) {
+                            chunks.push(chunk);
+                        }
                     }
                 }
             }
@@ -2730,7 +2755,7 @@ impl Association {
     fn bundle_data_chunks_into_packets(&self, chunks: Vec<ChunkPayloadData>) -> Vec<Packet> {
         let mut packets = vec![];
         let mut chunks_to_send = vec![];
-        let mut bytes_in_packet = COMMON_HEADER_SIZE;
+        let mut bytes_in_packet = COMMON_HEADER_SIZE as usize;
 
         for c in chunks {
             // RFC 4960 sec 6.1.  Transmission of DATA Chunks
@@ -2738,13 +2763,15 @@ impl Association {
             //   single packet.  Furthermore, DATA chunks being retransmitted MAY be
             //   bundled with new DATA chunks, as long as the resulting packet size
             //   does not exceed the path MTU.
-            if bytes_in_packet + c.user_data.len() as u32 > self.mtu {
+            let mut chunk_size = DATA_CHUNK_HEADER_SIZE as usize + c.user_data.len();
+            chunk_size += get_padding_size(chunk_size);
+            if bytes_in_packet + chunk_size > self.mtu as usize {
                 packets.push(self.create_packet(chunks_to_send));
                 chunks_to_send = vec![];
-                bytes_in_packet = COMMON_HEADER_SIZE;
+                bytes_in_packet = COMMON_HEADER_SIZE as usize;
             }
 
-            bytes_in_packet += DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+            bytes_in_packet += chunk_size;
             chunks_to_send.push(Box::new(c));
         }
 
@@ -2825,7 +2852,7 @@ impl Association {
         ChunkSelectiveAck {
             cumulative_tsn_ack: self.peer_last_tsn,
             advertised_receiver_window_credit: self.get_my_receiver_window_credit(),
-            gap_ack_blocks: self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn),
+            gap_ack_blocks: self.payload_queue.get_gap_ack_blocks(),
             duplicate_tsn: self.payload_queue.pop_duplicates(),
         }
     }
@@ -2914,6 +2941,7 @@ impl Association {
             );
 
             self.inflight_queue.push_no_check(c.clone());
+            self.rack_insert(c.tsn);
 
             Some(c)
         } else {
@@ -2964,6 +2992,309 @@ impl Association {
     /// This is used only by testing.
     pub(crate) fn buffered_amount(&self) -> usize {
         self.pending_queue.get_num_bytes() + self.inflight_queue.get_num_bytes()
+    }
+
+    fn srtt_duration(&self) -> Option<Duration> {
+        if self.rto_mgr.srtt == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.rto_mgr.srtt))
+        }
+    }
+
+    fn duration_to_millis(duration: Duration) -> u64 {
+        duration.as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn enter_loss_recovery(&mut self) {
+        if self.in_fast_recovery {
+            return;
+        }
+
+        self.in_fast_recovery = true;
+        self.fast_recover_exit_point = self
+            .inflight_queue
+            .last_tsn()
+            .unwrap_or(self.cumulative_tsn_ack_point);
+        self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
+        self.cwnd = self.ssthresh;
+        self.partial_bytes_acked = 0;
+        trace!(
+            "[{}] updated cwnd={} ssthresh={} inflight={} (RACK)",
+            self.side,
+            self.cwnd,
+            self.ssthresh,
+            self.inflight_queue.get_num_bytes()
+        );
+    }
+
+    fn schedule_pto(&mut self, now: Instant) {
+        if self.inflight_queue.is_empty() {
+            self.timers.stop(Timer::Pto);
+            return;
+        }
+
+        let extra = if self.inflight_queue.len() == 1 {
+            RACK_WC_DEL_ACK
+        } else {
+            RACK_PTO_EXTRA
+        };
+        let pto = self
+            .srtt_duration()
+            .map(|srtt| srtt * 2 + extra)
+            .unwrap_or(Duration::from_secs(1));
+        self.timers
+            .start(Timer::Pto, now, Self::duration_to_millis(pto));
+    }
+
+    fn schedule_rack_timer(&mut self, now: Instant) {
+        let Some(delivered_time) = self.rack_delivered_time else {
+            self.timers.stop(Timer::Rack);
+            return;
+        };
+
+        if self.rack_head_tsn.is_none() {
+            self.timers.stop(Timer::Rack);
+            return;
+        }
+
+        let rack_rtt = now.saturating_duration_since(delivered_time);
+        let dur = core::cmp::max(rack_rtt + self.rack_reo_wnd, Duration::from_millis(1));
+        self.timers
+            .start(Timer::Rack, now, Self::duration_to_millis(dur));
+    }
+
+    fn on_rack_after_sack(
+        &mut self,
+        now: Instant,
+        newest_delivered_send_time: Option<Instant>,
+        newest_delivered_orig_tsn: u32,
+        delivered_found: bool,
+        sack: &ChunkSelectiveAck,
+    ) {
+        if delivered_found {
+            if sna32lt(self.rack_highest_delivered_orig_tsn, newest_delivered_orig_tsn) {
+                self.rack_highest_delivered_orig_tsn = newest_delivered_orig_tsn;
+            } else {
+                self.rack_reordering_seen = true;
+            }
+
+            if let Some(send_time) = newest_delivered_send_time {
+                self.rack_min_rtt_wnd
+                    .push(now, now.saturating_duration_since(send_time));
+            }
+
+            if newest_delivered_send_time
+                .is_some_and(|send_time| self.rack_delivered_time.is_none_or(|curr| send_time > curr))
+            {
+                self.rack_delivered_time = newest_delivered_send_time;
+            }
+        }
+
+        if let Some(min_rtt) = self.rack_min_rtt_wnd.min(now) {
+            self.rack_min_rtt = min_rtt;
+        }
+
+        let base_reo_wnd = if self.rack_min_rtt > Duration::ZERO {
+            self.rack_min_rtt / 4
+        } else {
+            Duration::ZERO
+        };
+
+        if !self.rack_reordering_seen
+            && (self.in_fast_recovery || self.timers.get(Timer::T3RTX).is_some())
+        {
+            self.rack_reo_wnd = Duration::ZERO;
+        } else if self.rack_reo_wnd == Duration::ZERO && base_reo_wnd > Duration::ZERO {
+            self.rack_reo_wnd = base_reo_wnd;
+        }
+
+        if !sack.duplicate_tsn.is_empty() && self.rack_min_rtt > Duration::ZERO {
+            self.rack_reo_wnd += base_reo_wnd;
+            self.rack_keep_inflated_recoveries = 16;
+        }
+
+        if !self.in_fast_recovery && self.rack_keep_inflated_recoveries > 0 {
+            self.rack_keep_inflated_recoveries -= 1;
+            if self.rack_keep_inflated_recoveries == 0 && self.rack_min_rtt > Duration::ZERO {
+                self.rack_reo_wnd = self.rack_min_rtt / 4;
+            }
+        }
+
+        if let Some(srtt) = self.srtt_duration() {
+            if self.rack_reo_wnd > srtt {
+                self.rack_reo_wnd = srtt;
+            }
+        }
+
+        if let Some(delivered_time) = self.rack_delivered_time {
+            if self.mark_rack_losses(delivered_time) {
+                self.awake_write_loop();
+            }
+        }
+
+        self.schedule_rack_timer(now);
+        self.schedule_pto(now);
+    }
+
+    fn on_rack_timeout(&mut self, now: Instant) {
+        if let Some(delivered_time) = self.rack_delivered_time {
+            if self.mark_rack_losses(delivered_time) {
+                self.awake_write_loop();
+            }
+        }
+        self.schedule_rack_timer(now);
+    }
+
+    fn on_pto_timeout(&mut self, now: Instant) {
+        self.stats.inc_pto_timeouts();
+
+        if self.inflight_queue.is_empty() {
+            self.timers.stop(Timer::Pto);
+            return;
+        }
+
+        if !self.pending_queue.is_empty() {
+            self.schedule_pto(now);
+            self.awake_write_loop();
+            return;
+        }
+
+        let Some(mut tsn) = self.inflight_queue.last_tsn() else {
+            self.timers.stop(Timer::Pto);
+            return;
+        };
+
+        loop {
+            let Some(chunk) = self.inflight_queue.get(tsn) else {
+                break;
+            };
+            if !chunk.acked && !chunk.abandoned() {
+                if let Some(chunk) = self.inflight_queue.get_mut(tsn) {
+                    chunk.retransmit = true;
+                }
+                self.schedule_pto(now);
+                self.awake_write_loop();
+                return;
+            }
+
+            if tsn == self.cumulative_tsn_ack_point + 1 {
+                break;
+            }
+            tsn -= 1;
+        }
+
+        self.timers.stop(Timer::Pto);
+    }
+
+    fn mark_rack_losses(&mut self, delivered_time: Instant) -> bool {
+        let mut marked = false;
+        let mut current_tsn = self.rack_head_tsn;
+
+        while let Some(tsn) = current_tsn {
+            let Some(chunk) = self.inflight_queue.get(tsn) else {
+                break;
+            };
+
+            let next_tsn = chunk.rack_next_tsn;
+            let acked = chunk.acked;
+            let abandoned = chunk.abandoned();
+            let retransmit = chunk.retransmit;
+            let nsent = chunk.nsent;
+            let since = chunk.since;
+
+            if acked || abandoned {
+                self.rack_remove(tsn);
+                current_tsn = next_tsn;
+                continue;
+            }
+
+            if retransmit || nsent > 1 {
+                current_tsn = next_tsn;
+                continue;
+            }
+
+            let Some(sent_time) = since else {
+                current_tsn = next_tsn;
+                continue;
+            };
+
+            if sent_time >= delivered_time || delivered_time.duration_since(sent_time) <= self.rack_reo_wnd
+            {
+                break;
+            }
+
+            self.enter_loss_recovery();
+            if let Some(chunk) = self.inflight_queue.get_mut(tsn) {
+                chunk.retransmit = true;
+            }
+            self.stats.inc_rack_loss_marks();
+            self.rack_remove(tsn);
+            marked = true;
+            current_tsn = next_tsn;
+        }
+
+        marked
+    }
+
+    fn rack_insert(&mut self, tsn: u32) {
+        let Some(chunk) = self.inflight_queue.get(tsn) else {
+            return;
+        };
+        if chunk.rack_in_list {
+            return;
+        }
+
+        if let Some(tail_tsn) = self.rack_tail_tsn {
+            if let Some(tail) = self.inflight_queue.get_mut(tail_tsn) {
+                tail.rack_next_tsn = Some(tsn);
+            }
+            if let Some(chunk) = self.inflight_queue.get_mut(tsn) {
+                chunk.rack_prev_tsn = Some(tail_tsn);
+            }
+        } else {
+            self.rack_head_tsn = Some(tsn);
+        }
+
+        if let Some(chunk) = self.inflight_queue.get_mut(tsn) {
+            chunk.rack_next_tsn = None;
+            chunk.rack_in_list = true;
+        }
+        self.rack_tail_tsn = Some(tsn);
+    }
+
+    fn rack_remove(&mut self, tsn: u32) {
+        let Some(chunk) = self.inflight_queue.get(tsn) else {
+            return;
+        };
+        if !chunk.rack_in_list {
+            return;
+        }
+
+        let prev_tsn = chunk.rack_prev_tsn;
+        let next_tsn = chunk.rack_next_tsn;
+
+        if let Some(prev_tsn) = prev_tsn {
+            if let Some(prev) = self.inflight_queue.get_mut(prev_tsn) {
+                prev.rack_next_tsn = next_tsn;
+            }
+        } else {
+            self.rack_head_tsn = next_tsn;
+        }
+
+        if let Some(next_tsn) = next_tsn {
+            if let Some(next) = self.inflight_queue.get_mut(next_tsn) {
+                next.rack_prev_tsn = prev_tsn;
+            }
+        } else {
+            self.rack_tail_tsn = prev_tsn;
+        }
+
+        if let Some(chunk) = self.inflight_queue.get_mut(tsn) {
+            chunk.rack_prev_tsn = None;
+            chunk.rack_next_tsn = None;
+            chunk.rack_in_list = false;
+        }
     }
 
     fn awake_write_loop(&self) {
@@ -3041,6 +3372,13 @@ impl Association {
 
                 self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
+                self.timers.stop(Timer::Rack);
+                self.timers.stop(Timer::Pto);
+                if self.in_fast_recovery {
+                    self.in_fast_recovery = false;
+                    self.fast_recover_exit_point = 0;
+                    self.partial_bytes_acked = 0;
+                }
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.side,

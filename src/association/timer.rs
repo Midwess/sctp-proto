@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::config::{RTO_INITIAL, RTO_MAX, RTO_MIN};
 
 pub(crate) const ACK_INTERVAL: u64 = 200;
-const TIMER_COUNT: usize = 6;
+const TIMER_COUNT: usize = 8;
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub(crate) enum Timer {
@@ -14,6 +14,8 @@ pub(crate) enum Timer {
     T3RTX = 3,
     Reconfig = 4,
     Ack = 5,
+    Rack = 6,
+    Pto = 7,
 }
 
 impl Timer {
@@ -24,6 +26,8 @@ impl Timer {
         Timer::T3RTX,
         Timer::Reconfig,
         Timer::Ack,
+        Timer::Rack,
+        Timer::Pto,
     ];
 }
 
@@ -63,6 +67,8 @@ impl TimerTable {
                 max_data_retransmits, //T3RTX
                 max_init_retransmits, //Reconfig
                 None,                 //Ack (unlimited)
+                None,                 //Rack (deadline only)
+                None,                 //Pto (deadline only)
             ],
             rto_max,
             ..Default::default()
@@ -82,7 +88,7 @@ impl TimerTable {
     }
 
     pub fn start(&mut self, timer: Timer, now: Instant, interval: u64) {
-        let interval = if timer == Timer::Ack {
+        let interval = if matches!(timer, Timer::Ack | Timer::Rack | Timer::Pto) {
             interval
         } else {
             calculate_next_timeout(interval, self.retrans[timer as usize], self.rto_max)

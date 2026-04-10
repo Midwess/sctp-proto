@@ -1,4 +1,4 @@
-use crate::chunk::{Chunk, chunk_init::ChunkInit};
+use crate::chunk::{Chunk, chunk_init::ChunkInit, chunk_selective_ack::GapAckBlock};
 use crate::config::generate_snap_token;
 
 use super::*;
@@ -15,6 +15,24 @@ fn create_association(config: TransportConfig) -> Association {
         None,
         Instant::now(),
     )
+}
+
+fn push_outstanding_chunk(
+    a: &mut Association,
+    tsn: u32,
+    sent_at: Instant,
+    payload_len: usize,
+) {
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        since: Some(sent_at),
+        nsent: 1,
+        user_data: Bytes::from(vec![0; payload_len]),
+        ..Default::default()
+    });
+    a.rack_insert(tsn);
 }
 
 #[test]
@@ -171,7 +189,6 @@ fn test_handle_forward_tsn_forward_1for1_missing() -> Result<()> {
             user_data: Bytes::from_static(b"ABC"),
             ..Default::default()
         },
-        a.peer_last_tsn,
     );
 
     let fwdtsn = ChunkForwardTsn {
@@ -222,7 +239,6 @@ fn test_handle_forward_tsn_forward_1for2_missing() -> Result<()> {
             user_data: Bytes::from_static(b"ABC"),
             ..Default::default()
         },
-        a.peer_last_tsn,
     );
 
     let fwdtsn = ChunkForwardTsn {
@@ -307,6 +323,107 @@ fn test_assoc_create_new_stream() -> Result<()> {
 
     let p = a.handle_data(&to_be_ignored)?;
     assert!(p.is_empty(), "should return empty");
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_sack_marks_rack_loss_for_older_outstanding_chunk() -> Result<()> {
+    let now = Instant::now();
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 4800,
+        rwnd: 4800,
+        ssthresh: 4800,
+        cumulative_tsn_ack_point: 9,
+        rack_highest_delivered_orig_tsn: 9,
+        ..Default::default()
+    };
+
+    push_outstanding_chunk(&mut a, 10, now - Duration::from_millis(140), 100);
+    push_outstanding_chunk(&mut a, 11, now - Duration::from_millis(100), 100);
+
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 9,
+        advertised_receiver_window_credit: 4800,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end: 2 }],
+        duplicate_tsn: vec![],
+    };
+
+    let packets = a.handle_sack(&sack, now)?;
+
+    assert!(packets.is_empty(), "SACK handling should not emit packets");
+    assert!(a.inflight_queue.get(11).is_some_and(|chunk| chunk.acked));
+    assert!(a.inflight_queue.get(10).is_some_and(|chunk| chunk.retransmit));
+    assert!(a.in_fast_recovery, "RACK loss should enter recovery");
+    assert_eq!(1, a.stats.get_num_rack_loss_marks(), "one chunk should be marked lost");
+    assert!(a.rack_min_rtt > Duration::ZERO, "RACK min RTT should be updated");
+
+    Ok(())
+}
+
+#[test]
+fn test_on_pto_timeout_marks_latest_outstanding_chunk_for_probe() -> Result<()> {
+    let now = Instant::now();
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 4800,
+        rwnd: 4800,
+        cumulative_tsn_ack_point: 9,
+        ..Default::default()
+    };
+
+    push_outstanding_chunk(&mut a, 10, now - Duration::from_millis(200), 100);
+    push_outstanding_chunk(&mut a, 11, now - Duration::from_millis(100), 100);
+
+    a.on_pto_timeout(now);
+
+    assert!(
+        a.inflight_queue.get(11).is_some_and(|chunk| chunk.retransmit),
+        "latest outstanding TSN should be probed first"
+    );
+    assert!(
+        a.inflight_queue.get(10).is_some_and(|chunk| !chunk.retransmit),
+        "older TSNs should not be probed first"
+    );
+    assert_eq!(1, a.stats.get_num_pto_timeouts(), "PTO counter should increment");
+    assert!(a.timers.get(Timer::Pto).is_some(), "PTO timer should be re-armed");
+
+    Ok(())
+}
+
+#[test]
+fn test_on_pto_timeout_prefers_pending_data_over_probe() -> Result<()> {
+    let now = Instant::now();
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 4800,
+        rwnd: 4800,
+        cumulative_tsn_ack_point: 9,
+        ..Default::default()
+    };
+
+    push_outstanding_chunk(&mut a, 10, now - Duration::from_millis(100), 100);
+    a.pending_queue.push(ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        stream_identifier: 1,
+        user_data: Bytes::from_static(b"pending"),
+        ..Default::default()
+    });
+
+    a.on_pto_timeout(now);
+
+    assert!(
+        a.inflight_queue.get(10).is_some_and(|chunk| !chunk.retransmit),
+        "pending data should be preferred over a PTO probe"
+    );
+    assert_eq!(1, a.pending_queue.len(), "pending data should remain queued for normal send");
+    assert_eq!(1, a.stats.get_num_pto_timeouts(), "PTO counter should increment");
+    assert!(a.timers.get(Timer::Pto).is_some(), "PTO timer should be re-armed");
 
     Ok(())
 }
