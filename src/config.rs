@@ -42,7 +42,7 @@ pub enum TransportConfigError {
 
 /// Config collects the arguments to create_association construction into
 /// a single structure
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TransportConfig {
     max_receive_buffer_size: u32,
     max_num_outbound_streams: u16,
