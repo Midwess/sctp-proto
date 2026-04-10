@@ -2,6 +2,7 @@ use bytes::Bytes;
 use sctp_proto::{
     Association, AssociationHandle, AssociationStats, ClientConfig, DatagramEvent, Endpoint,
     EndpointConfig, Event, Payload, PayloadProtocolIdentifier, ServerConfig, StreamEvent, Transmit,
+    TransportConfig,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -12,6 +13,9 @@ use std::time::{Duration, Instant};
 const STREAM_ID: u16 = 7;
 const TICK: Duration = Duration::from_millis(10);
 const LINK_LATENCY: Duration = Duration::from_millis(20);
+const DEMO_RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(5);
+const DEMO_RACK_REO_WND_FLOOR: Duration = Duration::from_millis(5);
+const DEMO_RACK_WORST_CASE_DELAYED_ACK: Duration = Duration::from_millis(75);
 
 #[derive(Debug)]
 struct QueuedDatagram {
@@ -54,6 +58,7 @@ struct Peer {
     name: &'static str,
     addr: SocketAddr,
     endpoint: Endpoint,
+    connect_config: Option<ClientConfig>,
     associations: HashMap<AssociationHandle, Association>,
     accepted: Option<AssociationHandle>,
     pending_assoc_events: HashMap<AssociationHandle, VecDeque<sctp_proto::AssociationEvent>>,
@@ -61,11 +66,14 @@ struct Peer {
 }
 
 impl Peer {
-    fn new_client(addr: SocketAddr) -> Self {
+    fn new_client(addr: SocketAddr, transport: Arc<TransportConfig>) -> Self {
+        let mut connect_config = ClientConfig::default();
+        connect_config.transport = transport;
         Self {
             name: "client",
             addr,
             endpoint: Endpoint::new(Arc::new(EndpointConfig::default()), None),
+            connect_config: Some(connect_config),
             associations: HashMap::new(),
             accepted: None,
             pending_assoc_events: HashMap::new(),
@@ -73,14 +81,17 @@ impl Peer {
         }
     }
 
-    fn new_server(addr: SocketAddr) -> Self {
+    fn new_server(addr: SocketAddr, transport: Arc<TransportConfig>) -> Self {
+        let mut server_config = ServerConfig::default();
+        server_config.transport = transport;
         Self {
             name: "server",
             addr,
             endpoint: Endpoint::new(
                 Arc::new(EndpointConfig::default()),
-                Some(Arc::new(ServerConfig::default())),
+                Some(Arc::new(server_config)),
             ),
+            connect_config: None,
             associations: HashMap::new(),
             accepted: None,
             pending_assoc_events: HashMap::new(),
@@ -89,7 +100,11 @@ impl Peer {
     }
 
     fn begin_connect(&mut self, remote: SocketAddr) -> Result<AssociationHandle, Box<dyn Error>> {
-        let (handle, association) = self.endpoint.connect(ClientConfig::default(), remote)?;
+        let client_config = self
+            .connect_config
+            .clone()
+            .ok_or("client transport configuration is missing")?;
+        let (handle, association) = self.endpoint.connect(client_config, remote)?;
         self.associations.insert(handle, association);
         Ok(handle)
     }
@@ -131,7 +146,10 @@ impl Peer {
                     }
                 }
 
-                while association.poll_timeout().is_some_and(|deadline| deadline <= now) {
+                while association
+                    .poll_timeout()
+                    .is_some_and(|deadline| deadline <= now)
+                {
                     association.handle_timeout(now);
                 }
 
@@ -218,15 +236,15 @@ struct Lab {
 }
 
 impl Lab {
-    fn new() -> Self {
+    fn new(client_transport: Arc<TransportConfig>, server_transport: Arc<TransportConfig>) -> Self {
         let client_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 5000);
         let server_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 5001);
 
         Self {
             now: Instant::now(),
             latency: LINK_LATENCY,
-            client: Peer::new_client(client_addr),
-            server: Peer::new_server(server_addr),
+            client: Peer::new_client(client_addr, client_transport),
+            server: Peer::new_server(server_addr, server_transport),
             client_to_server: VecDeque::new(),
             server_to_client: VecDeque::new(),
             drop_client_to_server: 0,
@@ -355,8 +373,31 @@ impl Lab {
     }
 }
 
+fn demo_transport_config() -> Result<Arc<TransportConfig>, Box<dyn Error>> {
+    let config = TransportConfig::default()
+        .with_rack_min_rtt_window(DEMO_RACK_MIN_RTT_WINDOW)
+        .with_rack_reo_wnd_floor(DEMO_RACK_REO_WND_FLOOR)
+        .with_rack_worst_case_delayed_ack(DEMO_RACK_WORST_CASE_DELAYED_ACK);
+    config.validate()?;
+    Ok(Arc::new(config))
+}
+
+fn print_transport_config(label: &str, config: &TransportConfig) {
+    println!(
+        "{label}: rack_min_rtt_window={:?} rack_reo_wnd_floor={:?} rack_worst_case_delayed_ack={:?}",
+        config.get_rack_min_rtt_window(),
+        config.get_rack_reo_wnd_floor(),
+        config.get_rack_worst_case_delayed_ack(),
+    );
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut lab = Lab::new();
+    let client_transport = demo_transport_config()?;
+    let server_transport = demo_transport_config()?;
+    print_transport_config("client transport", client_transport.as_ref());
+    print_transport_config("server transport", server_transport.as_ref());
+
+    let mut lab = Lab::new(client_transport, server_transport);
     let (client_handle, server_handle) = lab.connect()?;
 
     {
@@ -408,8 +449,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     for value in ["c-msg-0", "c-msg-1", "c-msg-2", "c-msg-3"] {
         {
-            let mut stream = lab.client.association_mut(client_handle).stream(STREAM_ID)?;
-            stream.write_sctp(&Bytes::copy_from_slice(value.as_bytes()), PayloadProtocolIdentifier::Binary)?;
+            let mut stream = lab
+                .client
+                .association_mut(client_handle)
+                .stream(STREAM_ID)?;
+            stream.write_sctp(
+                &Bytes::copy_from_slice(value.as_bytes()),
+                PayloadProtocolIdentifier::Binary,
+            )?;
         }
         lab.step();
     }
@@ -428,7 +475,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     lab.drop_server_to_client = 1;
 
     {
-        let mut stream = lab.server.association_mut(server_handle).stream(STREAM_ID)?;
+        let mut stream = lab
+            .server
+            .association_mut(server_handle)
+            .stream(STREAM_ID)?;
         stream.write_sctp(
             &Bytes::from_static(b"server-tail-loss"),
             PayloadProtocolIdentifier::Binary,
