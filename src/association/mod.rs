@@ -72,6 +72,14 @@ mod association_test;
 const RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 const RACK_WC_DEL_ACK: Duration = Duration::from_millis(200);
 const RACK_PTO_EXTRA: Duration = Duration::from_millis(2);
+const TLR_UNITS_PER_MTU: i64 = 4;
+const TLR_BURST_DEFAULT_FIRST_RTT: i64 = 16;
+const TLR_BURST_DEFAULT_LATER_RTT: i64 = 8;
+const TLR_BURST_MIN_FIRST_RTT: i64 = 8;
+const TLR_BURST_MIN_LATER_RTT: i64 = 5;
+const TLR_BURST_STEP_DOWN_FIRST_RTT: i64 = 4;
+const TLR_BURST_STEP_DOWN_LATER_RTT: i64 = 1;
+const TLR_GOOD_OPS_RESET_THRESHOLD: u32 = 16;
 
 #[derive(Debug, Clone)]
 struct WindowedMin {
@@ -265,6 +273,14 @@ pub struct Association {
     rack_keep_inflated_recoveries: u8,
     rack_head_tsn: Option<u32>,
     rack_tail_tsn: Option<u32>,
+    tlr_active: bool,
+    tlr_first_rtt: bool,
+    tlr_had_additional_loss: bool,
+    tlr_end_tsn: u32,
+    tlr_burst_first_rtt_units: i64,
+    tlr_burst_later_rtt_units: i64,
+    tlr_good_ops: u32,
+    tlr_start_time: Option<Instant>,
 
     // Chunks stored for retransmission
     stored_init: Option<ChunkInit>,
@@ -362,6 +378,14 @@ impl Default for Association {
             rack_keep_inflated_recoveries: 0,
             rack_head_tsn: None,
             rack_tail_tsn: None,
+            tlr_active: false,
+            tlr_first_rtt: false,
+            tlr_had_additional_loss: false,
+            tlr_end_tsn: 0,
+            tlr_burst_first_rtt_units: TLR_BURST_DEFAULT_FIRST_RTT,
+            tlr_burst_later_rtt_units: TLR_BURST_DEFAULT_LATER_RTT,
+            tlr_good_ops: 0,
+            tlr_start_time: None,
 
             // Chunks stored for retransmission
             stored_init: None,
@@ -1620,6 +1644,7 @@ impl Association {
             delivered_found,
             d,
         );
+        self.tlr_maybe_finish(now, cum_tsn_ack_point_advanced || delivered_found);
 
         Ok(vec![])
     }
@@ -2342,8 +2367,20 @@ impl Association {
         let state = self.state();
         match state {
             AssociationState::Established => {
-                raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
-                raw_packets = self.gather_outbound_data_and_reconfig_packets(raw_packets, now);
+                let mut budget_scaled = self.tlr_current_burst_budget_scaled(now);
+                let mut consumed = false;
+                raw_packets = self.gather_data_packets_to_retransmit(
+                    raw_packets,
+                    now,
+                    &mut budget_scaled,
+                    &mut consumed,
+                );
+                raw_packets = self.gather_outbound_data_and_reconfig_packets(
+                    raw_packets,
+                    now,
+                    &mut budget_scaled,
+                    &mut consumed,
+                );
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)
@@ -2351,7 +2388,14 @@ impl Association {
             AssociationState::ShutdownPending
             | AssociationState::ShutdownSent
             | AssociationState::ShutdownReceived => {
-                raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
+                let mut budget_scaled = self.tlr_current_burst_budget_scaled(now);
+                let mut consumed = false;
+                raw_packets = self.gather_data_packets_to_retransmit(
+                    raw_packets,
+                    now,
+                    &mut budget_scaled,
+                    &mut consumed,
+                );
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 self.gather_outbound_shutdown_packets(raw_packets, now)
             }
@@ -2366,8 +2410,10 @@ impl Association {
         &mut self,
         mut raw_packets: Vec<Bytes>,
         now: Instant,
+        budget_scaled: &mut i64,
+        consumed: &mut bool,
     ) -> Vec<Bytes> {
-        for p in &self.get_data_packets_to_retransmit(now) {
+        for p in &self.get_data_packets_to_retransmit(now, budget_scaled, consumed) {
             if let Ok(raw) = p.marshal() {
                 raw_packets.push(raw);
             } else {
@@ -2385,10 +2431,13 @@ impl Association {
         &mut self,
         mut raw_packets: Vec<Bytes>,
         now: Instant,
+        budget_scaled: &mut i64,
+        consumed: &mut bool,
     ) -> Vec<Bytes> {
         // Pop unsent data chunks from the pending queue to send as much as
         // cwnd and rwnd allow.
-        let (chunks, sis_to_reset) = self.pop_pending_data_chunks_to_send(now);
+        let (chunks, sis_to_reset) =
+            self.pop_pending_data_chunks_to_send(now, budget_scaled, consumed);
         if !chunks.is_empty() {
             // Start timer. (noop if already started)
             trace!("[{}] T3-rtx timer start (pt1)", self.side);
@@ -2574,7 +2623,12 @@ impl Association {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed
     /// out and retransmit outstanding data chunks that are not acked
     /// or abandoned yet.
-    fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
+    fn get_data_packets_to_retransmit(
+        &mut self,
+        now: Instant,
+        budget_scaled: &mut i64,
+        consumed: &mut bool,
+    ) -> Vec<Packet> {
         let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
@@ -2615,6 +2669,10 @@ impl Association {
                 if bytes_in_packet > 0 && bytes_in_packet + chunk_bytes > self.mtu as usize {
                     bytes_in_packet = 0;
                     continue;
+                }
+
+                if !self.tlr_allow_send(budget_scaled, consumed, add_bytes) {
+                    return self.bundle_data_chunks_into_packets(chunks);
                 }
 
                 if bytes_in_packet == 0 {
@@ -2660,6 +2718,8 @@ impl Association {
     fn pop_pending_data_chunks_to_send(
         &mut self,
         now: Instant,
+        budget_scaled: &mut i64,
+        consumed: &mut bool,
     ) -> (Vec<ChunkPayloadData>, Vec<u16>) {
         let mut chunks = vec![];
         let mut sis_to_reset = vec![]; // stream identifiers to reset
@@ -2704,13 +2764,19 @@ impl Association {
                 let mut chunk_bytes = DATA_CHUNK_HEADER_SIZE as usize + data_len;
                 chunk_bytes += get_padding_size(chunk_bytes);
                 if bytes_in_packet == 0 {
-                    if COMMON_HEADER_SIZE as usize + chunk_bytes > self.mtu as usize {
+                    let add_bytes = COMMON_HEADER_SIZE as usize + chunk_bytes;
+                    if add_bytes > self.mtu as usize {
+                        break;
+                    }
+                    if !self.tlr_allow_send(budget_scaled, consumed, add_bytes) {
                         break;
                     }
                     bytes_in_packet = COMMON_HEADER_SIZE as usize;
                 } else if bytes_in_packet + chunk_bytes > self.mtu as usize {
                     bytes_in_packet = 0;
                     continue;
+                } else if !self.tlr_allow_send(budget_scaled, consumed, chunk_bytes) {
+                    break;
                 }
 
                 self.rwnd -= data_len as u32;
@@ -2732,8 +2798,11 @@ impl Association {
                     let (beginning_fragment, unordered) = (c.beginning_fragment, c.unordered);
                     let mut chunk_bytes = DATA_CHUNK_HEADER_SIZE as usize + c.user_data.len();
                     chunk_bytes += get_padding_size(chunk_bytes);
+                    let add_bytes = COMMON_HEADER_SIZE as usize + chunk_bytes;
 
-                    if COMMON_HEADER_SIZE as usize + chunk_bytes <= self.mtu as usize {
+                    if add_bytes <= self.mtu as usize
+                        && self.tlr_allow_send(budget_scaled, consumed, add_bytes)
+                    {
                         if let Some(chunk) = self.move_pending_data_chunk_to_inflight_queue(
                             beginning_fragment,
                             unordered,
@@ -3006,6 +3075,125 @@ impl Association {
         duration.as_millis().min(u128::from(u64::MAX)) as u64
     }
 
+    fn tlr_first_rtt_duration(&self) -> Duration {
+        self.srtt_duration().unwrap_or(Duration::from_secs(1))
+    }
+
+    fn tlr_update_phase(&mut self, now: Instant) {
+        if !self.tlr_active || !self.tlr_first_rtt {
+            return;
+        }
+
+        let Some(start_time) = self.tlr_start_time else {
+            return;
+        };
+
+        if now.saturating_duration_since(start_time) >= self.tlr_first_rtt_duration() {
+            self.tlr_first_rtt = false;
+        }
+    }
+
+    fn tlr_current_burst_units(&mut self, now: Instant) -> i64 {
+        if !self.tlr_active {
+            return 0;
+        }
+
+        self.tlr_update_phase(now);
+        if self.tlr_first_rtt {
+            self.tlr_burst_first_rtt_units
+        } else {
+            self.tlr_burst_later_rtt_units
+        }
+    }
+
+    fn tlr_current_burst_budget_scaled(&mut self, now: Instant) -> i64 {
+        self.tlr_current_burst_units(now) * self.mtu as i64
+    }
+
+    fn tlr_highest_outstanding_tsn(&self) -> Option<u32> {
+        self.inflight_queue.last_tsn()
+    }
+
+    fn tlr_begin(&mut self, now: Instant) {
+        self.tlr_active = true;
+        self.tlr_first_rtt = true;
+        self.tlr_had_additional_loss = false;
+        self.tlr_start_time = Some(now);
+        self.tlr_end_tsn = self
+            .tlr_highest_outstanding_tsn()
+            .unwrap_or(self.cumulative_tsn_ack_point);
+    }
+
+    fn tlr_apply_additional_loss(&mut self, now: Instant) {
+        if !self.tlr_active {
+            return;
+        }
+
+        self.tlr_update_phase(now);
+        self.tlr_had_additional_loss = true;
+        self.tlr_good_ops = 0;
+
+        if self.tlr_first_rtt {
+            self.tlr_burst_first_rtt_units = core::cmp::max(
+                self.tlr_burst_first_rtt_units - TLR_BURST_STEP_DOWN_FIRST_RTT,
+                TLR_BURST_MIN_FIRST_RTT,
+            );
+        } else {
+            self.tlr_burst_later_rtt_units = core::cmp::max(
+                self.tlr_burst_later_rtt_units - TLR_BURST_STEP_DOWN_LATER_RTT,
+                TLR_BURST_MIN_LATER_RTT,
+            );
+        }
+    }
+
+    fn tlr_maybe_finish(&mut self, _now: Instant, ack_progress: bool) {
+        if !self.tlr_active {
+            return;
+        }
+
+        if self.tlr_first_rtt && ack_progress {
+            self.tlr_first_rtt = false;
+        }
+
+        if sna32gte(self.cumulative_tsn_ack_point, self.tlr_end_tsn) {
+            if !self.tlr_had_additional_loss {
+                self.tlr_good_ops += 1;
+                if self.tlr_good_ops >= TLR_GOOD_OPS_RESET_THRESHOLD {
+                    self.tlr_burst_first_rtt_units = TLR_BURST_DEFAULT_FIRST_RTT;
+                    self.tlr_burst_later_rtt_units = TLR_BURST_DEFAULT_LATER_RTT;
+                    self.tlr_good_ops = 0;
+                }
+            } else {
+                self.tlr_good_ops = 0;
+            }
+
+            self.tlr_active = false;
+            self.tlr_first_rtt = false;
+            self.tlr_had_additional_loss = false;
+            self.tlr_end_tsn = 0;
+            self.tlr_start_time = None;
+        }
+    }
+
+    fn tlr_allow_send(&self, budget_scaled: &mut i64, consumed: &mut bool, est_bytes: usize) -> bool {
+        if !self.tlr_active || est_bytes == 0 {
+            return true;
+        }
+
+        let need_scaled = est_bytes as i64 * TLR_UNITS_PER_MTU;
+        if *consumed && *budget_scaled < need_scaled {
+            return false;
+        }
+
+        *budget_scaled -= need_scaled;
+        if *budget_scaled < 0 {
+            *budget_scaled = 0;
+        }
+        *consumed = true;
+
+        true
+    }
+
     fn enter_loss_recovery(&mut self) {
         if self.in_fast_recovery {
             return;
@@ -3128,7 +3316,7 @@ impl Association {
         }
 
         if let Some(delivered_time) = self.rack_delivered_time {
-            if self.mark_rack_losses(delivered_time) {
+            if self.mark_rack_losses(now, delivered_time) {
                 self.awake_write_loop();
             }
         }
@@ -3139,7 +3327,7 @@ impl Association {
 
     fn on_rack_timeout(&mut self, now: Instant) {
         if let Some(delivered_time) = self.rack_delivered_time {
-            if self.mark_rack_losses(delivered_time) {
+            if self.mark_rack_losses(now, delivered_time) {
                 self.awake_write_loop();
             }
         }
@@ -3152,6 +3340,12 @@ impl Association {
         if self.inflight_queue.is_empty() {
             self.timers.stop(Timer::Pto);
             return;
+        }
+
+        if !self.tlr_active {
+            self.tlr_begin(now);
+        } else {
+            self.tlr_apply_additional_loss(now);
         }
 
         if !self.pending_queue.is_empty() {
@@ -3187,7 +3381,7 @@ impl Association {
         self.timers.stop(Timer::Pto);
     }
 
-    fn mark_rack_losses(&mut self, delivered_time: Instant) -> bool {
+    fn mark_rack_losses(&mut self, now: Instant, delivered_time: Instant) -> bool {
         let mut marked = false;
         let mut current_tsn = self.rack_head_tsn;
 
@@ -3232,6 +3426,10 @@ impl Association {
             self.rack_remove(tsn);
             marked = true;
             current_tsn = next_tsn;
+        }
+
+        if marked && self.tlr_active {
+            self.tlr_apply_additional_loss(now);
         }
 
         marked

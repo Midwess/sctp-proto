@@ -35,6 +35,53 @@ fn push_outstanding_chunk(
     a.rack_insert(tsn);
 }
 
+fn new_tlr_test_assoc() -> Association {
+    Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 1_000_000,
+        rwnd: 1_000_000,
+        ssthresh: 1_000_000,
+        my_next_tsn: 100,
+        my_next_rsn: 100,
+        cumulative_tsn_ack_point: 99,
+        tlr_burst_first_rtt_units: TLR_BURST_DEFAULT_FIRST_RTT,
+        tlr_burst_later_rtt_units: TLR_BURST_DEFAULT_LATER_RTT,
+        ..Default::default()
+    }
+}
+
+fn push_pending_full_packet_chunks(a: &mut Association, n: usize) {
+    let user_len = a.mtu as usize - (COMMON_HEADER_SIZE as usize + DATA_CHUNK_HEADER_SIZE as usize);
+    assert!(user_len > 0);
+
+    for _ in 0..n {
+        a.pending_queue.push(ChunkPayloadData {
+            stream_identifier: 0,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from(vec![0; user_len]),
+            ..Default::default()
+        });
+    }
+}
+
+fn push_inflight_retransmit_full_packet_chunks(a: &mut Association, start_tsn: u32, n: usize) {
+    let user_len = a.mtu as usize - (COMMON_HEADER_SIZE as usize + DATA_CHUNK_HEADER_SIZE as usize);
+    assert!(user_len > 0);
+
+    for i in 0..n {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn: start_tsn + i as u32,
+            stream_identifier: 0,
+            user_data: Bytes::from(vec![0; user_len]),
+            nsent: 1,
+            retransmit: true,
+            ..Default::default()
+        });
+    }
+}
+
 #[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association {
@@ -380,6 +427,8 @@ fn test_on_pto_timeout_marks_latest_outstanding_chunk_for_probe() -> Result<()> 
 
     a.on_pto_timeout(now);
 
+    assert!(a.tlr_active, "PTO should begin TLR when inflight data exists");
+    assert!(a.tlr_first_rtt, "TLR should start in first-RTT phase");
     assert!(
         a.inflight_queue.get(11).is_some_and(|chunk| chunk.retransmit),
         "latest outstanding TSN should be probed first"
@@ -417,6 +466,7 @@ fn test_on_pto_timeout_prefers_pending_data_over_probe() -> Result<()> {
 
     a.on_pto_timeout(now);
 
+    assert!(a.tlr_active, "PTO should begin TLR when inflight data exists");
     assert!(
         a.inflight_queue.get(10).is_some_and(|chunk| !chunk.retransmit),
         "pending data should be preferred over a PTO probe"
@@ -426,6 +476,193 @@ fn test_on_pto_timeout_prefers_pending_data_over_probe() -> Result<()> {
     assert!(a.timers.get(Timer::Pto).is_some(), "PTO timer should be re-armed");
 
     Ok(())
+}
+
+#[test]
+fn test_tlr_allow_send_budget_gating_and_first_send_always_allowed() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = true;
+    a.tlr_start_time = Some(now);
+
+    let mut budget = a.tlr_current_burst_budget_scaled(now);
+    let mut consumed = false;
+    let mut allowed = 0;
+    while a.tlr_allow_send(&mut budget, &mut consumed, a.mtu as usize) {
+        allowed += 1;
+    }
+    assert_eq!(4, allowed, "first RTT TLR budget should allow exactly 4 MTUs");
+
+    let mut budget = 1_000;
+    let mut consumed = false;
+    let ok1 = a.tlr_allow_send(&mut budget, &mut consumed, a.mtu as usize);
+    let ok2 = a.tlr_allow_send(&mut budget, &mut consumed, a.mtu as usize);
+    assert!(ok1, "first send should always be allowed");
+    assert!(!ok2, "second send should be gated once budget is exhausted");
+    assert!(consumed, "budget should be marked consumed");
+    assert_eq!(0, budget, "budget should clamp at zero");
+}
+
+#[test]
+fn test_tlr_begin_sets_end_tsn_to_highest_outstanding() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    push_inflight_retransmit_full_packet_chunks(&mut a, 100, 5);
+
+    a.tlr_begin(now);
+
+    assert!(a.tlr_active);
+    assert!(a.tlr_first_rtt);
+    assert!(!a.tlr_had_additional_loss);
+    assert_eq!(104, a.tlr_end_tsn);
+    assert_eq!(Some(now), a.tlr_start_time);
+}
+
+#[test]
+fn test_tlr_phase_switches_to_later_on_ack_progress() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = true;
+    a.tlr_start_time = Some(now);
+    a.tlr_end_tsn = a.cumulative_tsn_ack_point + 100;
+
+    a.tlr_maybe_finish(now, true);
+
+    assert!(!a.tlr_first_rtt);
+    assert_eq!(
+        TLR_BURST_DEFAULT_LATER_RTT,
+        a.tlr_current_burst_units(now),
+        "later RTT burst budget should apply after ACK progress",
+    );
+}
+
+#[test]
+fn test_tlr_first_rtt_expires_by_time_srtt_and_fallback() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+
+    a.rto_mgr.set_new_rtt(100);
+    a.tlr_active = true;
+    a.tlr_first_rtt = true;
+    a.tlr_start_time = Some(now - Duration::from_millis(150));
+    a.tlr_update_phase(now);
+    assert!(!a.tlr_first_rtt, "first RTT should expire after SRTT");
+
+    a.rto_mgr.reset();
+    a.tlr_active = true;
+    a.tlr_first_rtt = true;
+    a.tlr_start_time = Some(now - Duration::from_millis(500));
+    a.tlr_update_phase(now);
+    assert!(a.tlr_first_rtt, "fallback should still be in first RTT before 1s");
+
+    a.tlr_start_time = Some(now - Duration::from_millis(1_100));
+    a.tlr_update_phase(now);
+    assert!(!a.tlr_first_rtt, "fallback should expire first RTT after 1s");
+}
+
+#[test]
+fn test_tlr_apply_additional_loss_first_rtt_step_down_and_clamp() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = true;
+    a.tlr_start_time = Some(now);
+    a.tlr_had_additional_loss = false;
+    a.tlr_good_ops = 7;
+
+    a.tlr_apply_additional_loss(now + Duration::from_millis(10));
+    assert!(a.tlr_had_additional_loss);
+    assert_eq!(0, a.tlr_good_ops);
+    assert_eq!(12, a.tlr_burst_first_rtt_units);
+    assert_eq!(TLR_BURST_DEFAULT_LATER_RTT, a.tlr_burst_later_rtt_units);
+
+    a.tlr_apply_additional_loss(now + Duration::from_millis(20));
+    a.tlr_apply_additional_loss(now + Duration::from_millis(30));
+    assert_eq!(TLR_BURST_MIN_FIRST_RTT, a.tlr_burst_first_rtt_units);
+}
+
+#[test]
+fn test_tlr_apply_additional_loss_later_rtt_step_down_and_clamp() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = false;
+    a.tlr_start_time = Some(now - Duration::from_secs(10));
+
+    for _ in 0..10 {
+        a.tlr_apply_additional_loss(now);
+    }
+
+    assert_eq!(TLR_BURST_DEFAULT_FIRST_RTT, a.tlr_burst_first_rtt_units);
+    assert_eq!(TLR_BURST_MIN_LATER_RTT, a.tlr_burst_later_rtt_units);
+}
+
+#[test]
+fn test_tlr_maybe_finish_ends_and_clears_state_and_good_ops_reset() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = false;
+    a.tlr_had_additional_loss = false;
+    a.tlr_end_tsn = 200;
+    a.cumulative_tsn_ack_point = 200;
+    a.tlr_burst_first_rtt_units = TLR_BURST_MIN_FIRST_RTT;
+    a.tlr_burst_later_rtt_units = TLR_BURST_MIN_LATER_RTT;
+    a.tlr_good_ops = TLR_GOOD_OPS_RESET_THRESHOLD - 1;
+    a.tlr_start_time = Some(now);
+
+    a.tlr_maybe_finish(now, false);
+
+    assert!(!a.tlr_active);
+    assert!(!a.tlr_first_rtt);
+    assert!(!a.tlr_had_additional_loss);
+    assert_eq!(0, a.tlr_end_tsn);
+    assert_eq!(TLR_BURST_DEFAULT_FIRST_RTT, a.tlr_burst_first_rtt_units);
+    assert_eq!(TLR_BURST_DEFAULT_LATER_RTT, a.tlr_burst_later_rtt_units);
+    assert_eq!(0, a.tlr_good_ops);
+    assert!(a.tlr_start_time.is_none());
+}
+
+#[test]
+fn test_tlr_pop_pending_data_chunks_to_send_respects_burst_budget_first_rtt() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = true;
+    a.tlr_start_time = Some(now);
+    push_pending_full_packet_chunks(&mut a, 10);
+
+    let mut budget = a.tlr_current_burst_budget_scaled(now);
+    let mut consumed = false;
+    let (chunks, _) = a.pop_pending_data_chunks_to_send(now, &mut budget, &mut consumed);
+
+    assert_eq!(4, chunks.len(), "first RTT budget should allow 4 full-MTU chunks");
+    assert_eq!(4, a.inflight_queue.len(), "4 chunks should move to inflight");
+    assert_eq!(6, a.pending_queue.len(), "remaining chunks should stay pending");
+    assert!(consumed);
+    assert_eq!(0, budget);
+}
+
+#[test]
+fn test_tlr_get_data_packets_to_retransmit_respects_burst_budget_later_rtt() {
+    let now = Instant::now();
+    let mut a = new_tlr_test_assoc();
+    a.tlr_active = true;
+    a.tlr_first_rtt = false;
+    a.cumulative_tsn_ack_point = 99;
+    push_inflight_retransmit_full_packet_chunks(&mut a, 100, 6);
+
+    let mut budget = a.tlr_current_burst_budget_scaled(now);
+    let mut consumed = false;
+    let packets = a.get_data_packets_to_retransmit(now, &mut budget, &mut consumed);
+
+    let n_chunks: usize = packets.iter().map(|packet| packet.chunks.len()).sum();
+    assert_eq!(2, packets.len(), "later RTT budget should allow 2 full-MTU packets");
+    assert_eq!(2, n_chunks, "exactly 2 retransmit chunks should be emitted");
+    assert!(consumed);
+    assert_eq!(0, budget);
 }
 
 fn handle_init_test(name: &str, initial_state: AssociationState, expect_err: bool) {
