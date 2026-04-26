@@ -517,6 +517,7 @@ fn test_on_rack_after_sack_bounds_reo_wnd_by_srtt() {
     let now = Instant::now();
     let mut a = Association {
         rack_reo_wnd: Duration::from_millis(200),
+        rack_reo_wnd_floor: Duration::ZERO,
         ..Default::default()
     };
     a.rto_mgr.set_new_rtt(10);

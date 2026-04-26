@@ -3388,8 +3388,9 @@ impl Association {
         }
 
         if let Some(srtt) = self.srtt_duration() {
-            if self.rack_reo_wnd > srtt {
-                self.rack_reo_wnd = srtt;
+            let cap = core::cmp::max(srtt, self.rack_reo_wnd_floor);
+            if self.rack_reo_wnd > cap {
+                self.rack_reo_wnd = cap;
             }
         }
 
