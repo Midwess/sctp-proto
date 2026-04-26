@@ -385,6 +385,7 @@ fn test_handle_sack_marks_rack_loss_for_older_outstanding_chunk() -> Result<()> 
         ssthresh: 4800,
         cumulative_tsn_ack_point: 9,
         rack_highest_delivered_orig_tsn: 9,
+        rack_reo_wnd_floor: Duration::ZERO,
         ..Default::default()
     };
 
@@ -437,6 +438,7 @@ fn test_on_rack_after_sack_duplicate_tsn_inflates_and_decays_reo_wnd() {
     let mut a = Association {
         rack_min_rtt: Duration::from_millis(100),
         rack_reo_wnd: Duration::from_millis(25),
+        rack_reo_wnd_floor: Duration::ZERO,
         rack_keep_inflated_recoveries: 0,
         ..Default::default()
     };
