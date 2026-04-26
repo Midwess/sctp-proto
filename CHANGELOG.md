@@ -1,5 +1,9 @@
 # Unreleased
 
+# 0.9.4
+
+  * `TransportConfig::for_relay()` now also sets `rto_min_ms=3000` so RACK has a clear 2-second window between its 800 ms reorder floor and the T3-rtx safety net. Production trace at `2026-04-26T17:29` showed `T3-rtx timed out: n_rtos=1 cwnd=1228` events on a slot whose jitter envelope expanded to 800-1000+ ms briefly under load — RTO at 1 s was racing RACK at 800 ms and winning, slamming cwnd to 1 MTU. With `rto_min_ms=3000` the race goes away: RACK at 800 ms always fires first, and only genuinely lost-and-RACK-missed packets wait for the slower RTO. The cost is +2 s recovery latency on rare RACK-misses, which is acceptable for bulk relay transfers.
+
 # 0.9.3
 
   * Retune `TransportConfig::for_relay()` based on production data:
