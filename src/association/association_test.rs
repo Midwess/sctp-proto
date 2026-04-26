@@ -479,6 +479,7 @@ fn test_on_rack_after_sack_suppresses_reo_wnd_during_recovery_without_reordering
         rack_reo_wnd: Duration::from_millis(40),
         rack_reordering_seen: false,
         in_fast_recovery: true,
+        rack_reo_wnd_floor: Duration::ZERO,
         ..Default::default()
     };
 

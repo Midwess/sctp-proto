@@ -3370,8 +3370,8 @@ impl Association {
         if !self.rack_reordering_seen
             && (self.in_fast_recovery || self.timers.get(Timer::T3RTX).is_some())
         {
-            self.rack_reo_wnd = Duration::ZERO;
-        } else if self.rack_reo_wnd == Duration::ZERO && base_reo_wnd > Duration::ZERO {
+            self.rack_reo_wnd = self.rack_reo_wnd_floor;
+        } else if base_reo_wnd > self.rack_reo_wnd {
             self.rack_reo_wnd = base_reo_wnd;
         }
 
