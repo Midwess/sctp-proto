@@ -3118,8 +3118,9 @@ impl Association {
         }
         self.last_stats_log = Some(now);
         debug!(
-            "[{}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
+            "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
             self.side,
+            self.peer_verification_tag,
             self.cwnd,
             self.ssthresh,
             self.rwnd,
