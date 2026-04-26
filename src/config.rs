@@ -27,6 +27,7 @@ const DEFAULT_MAX_INIT_RETRANS: usize = 8;
 pub(crate) const DEFAULT_RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_RACK_REO_WND_FLOOR: Duration = Duration::from_millis(250);
 pub(crate) const DEFAULT_RACK_WORST_CASE_DELAYED_ACK: Duration = Duration::from_millis(200);
+pub(crate) const DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT: u8 = 70;
 
 /// Errors returned when a [`TransportConfig`] contains invalid values.
 #[non_exhaustive]
@@ -38,6 +39,9 @@ pub enum TransportConfigError {
     /// RACK worst-case delayed ACK allowance must be strictly positive.
     #[error("invalid RACK worst-case delayed ACK: must be greater than zero")]
     InvalidRackWorstCaseDelayedAck,
+    /// RACK recovery cwnd factor must be in the range 1..=100.
+    #[error("invalid RACK recovery cwnd factor: must be in the range 1..=100")]
+    InvalidRackRecoveryCwndFactor,
 }
 
 /// Config collects the arguments to create_association construction into
@@ -89,6 +93,14 @@ pub struct TransportConfig {
     /// Worst-case delayed-ACK allowance used for PTO when only one packet is in flight.
     /// Default: 200 milliseconds.
     rack_worst_case_delayed_ack: Duration,
+
+    /// Multiplier (as a percentage in 1..=100) applied to cwnd when RACK marks a chunk
+    /// lost and the association enters fast recovery. Lower values are more aggressive
+    /// (RFC 4960's standard 50% halving uses 50). Higher values reflect RFC 8985 §7.1's
+    /// guidance that reordering-detected losses MAY use a gentler response since the
+    /// data may have only been delayed.
+    /// Default: 70.
+    rack_recovery_cwnd_factor_percent: u8,
 }
 
 impl Default for TransportConfig {
@@ -107,6 +119,7 @@ impl Default for TransportConfig {
             rack_min_rtt_window: DEFAULT_RACK_MIN_RTT_WINDOW,
             rack_reo_wnd_floor: DEFAULT_RACK_REO_WND_FLOOR,
             rack_worst_case_delayed_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
+            rack_recovery_cwnd_factor_percent: DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
         }
     }
 }
@@ -119,6 +132,9 @@ impl TransportConfig {
         }
         if self.rack_worst_case_delayed_ack.is_zero() {
             return Err(TransportConfigError::InvalidRackWorstCaseDelayedAck);
+        }
+        if self.rack_recovery_cwnd_factor_percent == 0 || self.rack_recovery_cwnd_factor_percent > 100 {
+            return Err(TransportConfigError::InvalidRackRecoveryCwndFactor);
         }
 
         Ok(())
@@ -223,6 +239,13 @@ impl TransportConfig {
         self
     }
 
+    /// Set the multiplier (as a percentage in 1..=100) applied to cwnd when RACK
+    /// marks a chunk lost and the association enters fast recovery.
+    pub fn with_rack_recovery_cwnd_factor_percent(mut self, value: u8) -> Self {
+        self.rack_recovery_cwnd_factor_percent = value;
+        self
+    }
+
     pub(crate) fn max_init_retransmits(&self) -> Option<usize> {
         self.max_init_retransmits
     }
@@ -256,6 +279,11 @@ impl TransportConfig {
     /// Get the configured worst-case delayed-ACK allowance used for single-packet PTO.
     pub fn get_rack_worst_case_delayed_ack(&self) -> Duration {
         self.rack_worst_case_delayed_ack
+    }
+
+    /// Get the configured RACK recovery cwnd factor (as a percentage in 1..=100).
+    pub fn get_rack_recovery_cwnd_factor_percent(&self) -> u8 {
+        self.rack_recovery_cwnd_factor_percent
     }
 }
 
@@ -493,6 +521,10 @@ mod test {
             DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
             config.get_rack_worst_case_delayed_ack()
         );
+        assert_eq!(
+            DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
+            config.get_rack_recovery_cwnd_factor_percent()
+        );
         assert_eq!(Ok(()), config.validate());
     }
 
@@ -501,7 +533,8 @@ mod test {
         let config = TransportConfig::default()
             .with_rack_min_rtt_window(Duration::from_secs(5))
             .with_rack_reo_wnd_floor(Duration::from_millis(3))
-            .with_rack_worst_case_delayed_ack(Duration::from_millis(75));
+            .with_rack_worst_case_delayed_ack(Duration::from_millis(75))
+            .with_rack_recovery_cwnd_factor_percent(50);
 
         assert_eq!(Duration::from_secs(5), config.get_rack_min_rtt_window());
         assert_eq!(Duration::from_millis(3), config.get_rack_reo_wnd_floor());
@@ -509,6 +542,7 @@ mod test {
             Duration::from_millis(75),
             config.get_rack_worst_case_delayed_ack()
         );
+        assert_eq!(50, config.get_rack_recovery_cwnd_factor_percent());
         assert_eq!(Ok(()), config.validate());
     }
 
@@ -526,5 +560,23 @@ mod test {
             Err(TransportConfigError::InvalidRackWorstCaseDelayedAck),
             invalid_del_ack.validate()
         );
+
+        let invalid_factor_zero =
+            TransportConfig::default().with_rack_recovery_cwnd_factor_percent(0);
+        assert_eq!(
+            Err(TransportConfigError::InvalidRackRecoveryCwndFactor),
+            invalid_factor_zero.validate()
+        );
+
+        let invalid_factor_too_high =
+            TransportConfig::default().with_rack_recovery_cwnd_factor_percent(101);
+        assert_eq!(
+            Err(TransportConfigError::InvalidRackRecoveryCwndFactor),
+            invalid_factor_too_high.validate()
+        );
+
+        let valid_boundary =
+            TransportConfig::default().with_rack_recovery_cwnd_factor_percent(100);
+        assert_eq!(Ok(()), valid_boundary.validate());
     }
 }

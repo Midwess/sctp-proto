@@ -1579,3 +1579,79 @@ fn test_out_of_band_rwnd_negotiation() {
         "rwnd should be remote's advertised window"
     );
 }
+
+#[test]
+fn test_enter_loss_recovery_uses_default_factor() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 100_000,
+        ..Default::default()
+    };
+
+    a.enter_loss_recovery();
+
+    assert!(a.in_fast_recovery, "RACK loss should enter fast recovery");
+    assert_eq!(
+        70_000, a.ssthresh,
+        "default 70% factor should reduce cwnd to 70_000"
+    );
+    assert_eq!(70_000, a.cwnd, "cwnd should match the new ssthresh");
+}
+
+#[test]
+fn test_enter_loss_recovery_honors_configured_factor() {
+    let mut a = create_association(
+        TransportConfig::default().with_rack_recovery_cwnd_factor_percent(50),
+    );
+    a.state = AssociationState::Established;
+    a.mtu = 1200;
+    a.cwnd = 100_000;
+
+    a.enter_loss_recovery();
+
+    assert!(a.in_fast_recovery);
+    assert_eq!(
+        50_000, a.ssthresh,
+        "configured 50% factor should restore standard halving"
+    );
+    assert_eq!(50_000, a.cwnd);
+}
+
+#[test]
+fn test_enter_loss_recovery_clamps_to_4_mtu_floor() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 1000,
+        ..Default::default()
+    };
+
+    a.enter_loss_recovery();
+
+    assert_eq!(
+        4 * 1200,
+        a.ssthresh,
+        "ssthresh must never drop below 4 * MTU regardless of factor"
+    );
+}
+
+#[test]
+fn test_enter_loss_recovery_is_idempotent_within_window() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 100_000,
+        ..Default::default()
+    };
+
+    a.enter_loss_recovery();
+    let cwnd_after_first = a.cwnd;
+
+    a.enter_loss_recovery();
+
+    assert_eq!(
+        cwnd_after_first, a.cwnd,
+        "subsequent calls within the same recovery window must not reduce cwnd further"
+    );
+}

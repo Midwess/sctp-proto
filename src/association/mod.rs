@@ -23,8 +23,8 @@ use crate::config::COMMON_HEADER_SIZE;
 use crate::config::DATA_CHUNK_HEADER_SIZE;
 use crate::config::DEFAULT_SCTP_PORT;
 use crate::config::{
-    DEFAULT_RACK_MIN_RTT_WINDOW, DEFAULT_RACK_REO_WND_FLOOR,
-    DEFAULT_RACK_WORST_CASE_DELAYED_ACK, ServerConfig, TransportConfig,
+    DEFAULT_RACK_MIN_RTT_WINDOW, DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
+    DEFAULT_RACK_REO_WND_FLOOR, DEFAULT_RACK_WORST_CASE_DELAYED_ACK, ServerConfig, TransportConfig,
 };
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
@@ -270,6 +270,7 @@ pub struct Association {
     rack_reo_wnd: Duration,
     rack_min_rtt: Duration,
     rack_wc_del_ack: Duration,
+    rack_recovery_cwnd_factor_percent: u8,
     rack_delivered_time: Option<Instant>,
     rack_highest_delivered_orig_tsn: u32,
     rack_reordering_seen: bool,
@@ -378,6 +379,7 @@ impl Default for Association {
             rack_reo_wnd: Duration::ZERO,
             rack_min_rtt: Duration::ZERO,
             rack_wc_del_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
+            rack_recovery_cwnd_factor_percent: DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
             rack_delivered_time: None,
             rack_highest_delivered_orig_tsn: 0,
             rack_reordering_seen: false,
@@ -473,6 +475,7 @@ impl Association {
             rack_min_rtt_wnd: WindowedMin::new(config.get_rack_min_rtt_window()),
             rack_reo_wnd_floor: config.get_rack_reo_wnd_floor(),
             rack_wc_del_ack: config.get_rack_worst_case_delayed_ack(),
+            rack_recovery_cwnd_factor_percent: config.get_rack_recovery_cwnd_factor_percent(),
             error: None,
 
             ..Default::default()
@@ -3278,15 +3281,18 @@ impl Association {
             .inflight_queue
             .last_tsn()
             .unwrap_or(self.cumulative_tsn_ack_point);
-        self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
+        let factor = self.rack_recovery_cwnd_factor_percent as u64;
+        let reduced = ((self.cwnd as u64) * factor / 100) as u32;
+        self.ssthresh = core::cmp::max(reduced, 4 * self.mtu);
         self.cwnd = self.ssthresh;
         self.partial_bytes_acked = 0;
         trace!(
-            "[{}] updated cwnd={} ssthresh={} inflight={} (RACK)",
+            "[{}] updated cwnd={} ssthresh={} inflight={} factor_pct={} (RACK)",
             self.side,
             self.cwnd,
             self.ssthresh,
-            self.inflight_queue.get_num_bytes()
+            self.inflight_queue.get_num_bytes(),
+            self.rack_recovery_cwnd_factor_percent
         );
     }
 
