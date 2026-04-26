@@ -790,6 +790,8 @@ impl Association {
             pending_chunks: self.pending_queue.len() as u64,
             bytes_sent: self.bytes_sent as u64,
             bytes_received: self.bytes_received as u64,
+            rack_reo_wnd_us: self.rack_reo_wnd.as_micros() as u64,
+            rack_min_rtt_us: self.rack_min_rtt.as_micros() as u64,
         }
     }
 
@@ -3118,7 +3120,7 @@ impl Association {
         }
         self.last_stats_log = Some(now);
         debug!(
-            "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
+            "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} reo_wnd_us={} min_rtt_us={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
             self.side,
             self.peer_verification_tag,
             self.cwnd,
@@ -3127,6 +3129,8 @@ impl Association {
             self.in_fast_recovery,
             self.rto_mgr.srtt,
             self.rto_mgr.get_rto(),
+            self.rack_reo_wnd.as_micros() as u64,
+            self.rack_min_rtt.as_micros() as u64,
             self.inflight_queue.get_num_bytes(),
             self.inflight_queue.len(),
             self.pending_queue.get_num_bytes(),

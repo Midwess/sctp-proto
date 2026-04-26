@@ -88,4 +88,6 @@ pub struct AssociationSnapshot {
     pub pending_chunks: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub rack_reo_wnd_us: u64,
+    pub rack_min_rtt_us: u64,
 }
