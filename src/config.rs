@@ -27,7 +27,7 @@ const DEFAULT_MAX_INIT_RETRANS: usize = 8;
 pub(crate) const DEFAULT_RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_RACK_REO_WND_FLOOR: Duration = Duration::from_millis(250);
 pub(crate) const DEFAULT_RACK_WORST_CASE_DELAYED_ACK: Duration = Duration::from_millis(200);
-pub(crate) const DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT: u8 = 70;
+pub(crate) const DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT: u8 = 50;
 
 /// Minimum cwnd cap allowed when `max_cwnd_bytes` is `Some(_)`. Equal to the
 /// RFC 4960 §7.2.1 initial cwnd lower bound, so that a configured cap can never
@@ -111,8 +111,9 @@ pub struct TransportConfig {
     ///
     /// Lower values are more aggressive. Higher values reflect RFC 8985 §7.1's guidance
     /// that reordering-detected losses MAY use a gentler response since the data may
-    /// have only been delayed.
-    /// Default: 70.
+    /// have only been delayed. The default keeps RFC 4960 halving in both regimes;
+    /// raise to e.g. 70 to opt in to the gentler reordering response.
+    /// Default: 50.
     rack_recovery_cwnd_factor_percent: u8,
 
     /// Optional hard upper bound applied to `cwnd` after each congestion-control

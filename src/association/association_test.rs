@@ -1613,10 +1613,10 @@ fn test_enter_loss_recovery_with_reorder_signal_uses_default_factor() {
 
     assert!(a.in_fast_recovery);
     assert_eq!(
-        70_000, a.ssthresh,
-        "with a reordering signal the default 70% factor should reduce cwnd to 70_000"
+        50_000, a.ssthresh,
+        "default factor is RFC 4960 halving (50) in both regimes"
     );
-    assert_eq!(70_000, a.cwnd);
+    assert_eq!(50_000, a.cwnd);
 }
 
 #[test]
