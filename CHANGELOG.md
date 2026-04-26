@@ -1,5 +1,9 @@
 # Unreleased
 
+# 0.9.5
+
+  * Raise `for_relay()` `rack_reo_wnd_floor` from 800ms to 1200ms. Production trace at `2026-04-26T17:47` showed the path's jitter envelope under deeper bursts extends well past 800ms — RACK marks fired at `delta_us` between 800,000 and **1,051,425** µs across all three slots, halving cwnd repeatedly despite the chunks not being lost (just delayed by the larger relay queue depth that grows with cwnd). All three slots dropped from 880KB / 540KB / 87KB cwnd down to 21KB-40KB through ~11+ RACK events each. With `rto_min_ms=3000` already shipped in 0.9.4, there's headroom for `reo_wnd_floor=1200ms` without any T3-vs-RACK race; T3 still fires at 3s as the safety net for genuinely lost packets RACK fails to catch. Real-loss detection latency increases by 400ms in the worst case, which is acceptable for bulk relay transfers.
+
 # 0.9.4
 
   * `TransportConfig::for_relay()` now also sets `rto_min_ms=3000` so RACK has a clear 2-second window between its 800 ms reorder floor and the T3-rtx safety net. Production trace at `2026-04-26T17:29` showed `T3-rtx timed out: n_rtos=1 cwnd=1228` events on a slot whose jitter envelope expanded to 800-1000+ ms briefly under load — RTO at 1 s was racing RACK at 800 ms and winning, slamming cwnd to 1 MTU. With `rto_min_ms=3000` the race goes away: RACK at 800 ms always fires first, and only genuinely lost-and-RACK-missed packets wait for the slower RTO. The cost is +2 s recovery latency on rare RACK-misses, which is acceptable for bulk relay transfers.
