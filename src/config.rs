@@ -102,11 +102,16 @@ pub struct TransportConfig {
     /// Default: 200 milliseconds.
     rack_worst_case_delayed_ack: Duration,
 
-    /// Multiplier (as a percentage in 1..=100) applied to cwnd when RACK marks a chunk
-    /// lost and the association enters fast recovery. Lower values are more aggressive
-    /// (RFC 4960's standard 50% halving uses 50). Higher values reflect RFC 8985 §7.1's
-    /// guidance that reordering-detected losses MAY use a gentler response since the
-    /// data may have only been delayed.
+    /// Multiplier (as a percentage in 1..=100) applied to cwnd on RACK-triggered fast
+    /// recovery, but only when recent SACKs have proven reordering is occurring (the
+    /// peer reported `duplicate_tsn` entries within the last 16 SACKs, i.e. the same
+    /// signal that inflates `rack_reo_wnd`). When no reordering signal is present the
+    /// reduction falls back to the standard RFC 4960 halving (50%), so this knob never
+    /// weakens the response to genuinely congestive loss.
+    ///
+    /// Lower values are more aggressive. Higher values reflect RFC 8985 §7.1's guidance
+    /// that reordering-detected losses MAY use a gentler response since the data may
+    /// have only been delayed.
     /// Default: 70.
     rack_recovery_cwnd_factor_percent: u8,
 

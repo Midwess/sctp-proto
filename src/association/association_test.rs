@@ -1581,7 +1581,7 @@ fn test_out_of_band_rwnd_negotiation() {
 }
 
 #[test]
-fn test_enter_loss_recovery_uses_default_factor() {
+fn test_enter_loss_recovery_without_reorder_signal_halves_cwnd() {
     let mut a = Association {
         state: AssociationState::Established,
         mtu: 1200,
@@ -1593,16 +1593,56 @@ fn test_enter_loss_recovery_uses_default_factor() {
 
     assert!(a.in_fast_recovery, "RACK loss should enter fast recovery");
     assert_eq!(
-        70_000, a.ssthresh,
-        "default 70% factor should reduce cwnd to 70_000"
+        50_000, a.ssthresh,
+        "without a reordering signal the response must fall back to standard 50% halving"
     );
-    assert_eq!(70_000, a.cwnd, "cwnd should match the new ssthresh");
+    assert_eq!(50_000, a.cwnd, "cwnd should match the new ssthresh");
 }
 
 #[test]
-fn test_enter_loss_recovery_honors_configured_factor() {
+fn test_enter_loss_recovery_with_reorder_signal_uses_default_factor() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        mtu: 1200,
+        cwnd: 100_000,
+        rack_keep_inflated_recoveries: 16,
+        ..Default::default()
+    };
+
+    a.enter_loss_recovery();
+
+    assert!(a.in_fast_recovery);
+    assert_eq!(
+        70_000, a.ssthresh,
+        "with a reordering signal the default 70% factor should reduce cwnd to 70_000"
+    );
+    assert_eq!(70_000, a.cwnd);
+}
+
+#[test]
+fn test_enter_loss_recovery_with_reorder_signal_honors_configured_factor() {
     let mut a = create_association(
-        TransportConfig::default().with_rack_recovery_cwnd_factor_percent(50),
+        TransportConfig::default().with_rack_recovery_cwnd_factor_percent(80),
+    );
+    a.state = AssociationState::Established;
+    a.mtu = 1200;
+    a.cwnd = 100_000;
+    a.rack_keep_inflated_recoveries = 16;
+
+    a.enter_loss_recovery();
+
+    assert!(a.in_fast_recovery);
+    assert_eq!(
+        80_000, a.ssthresh,
+        "configured 80% factor should apply when a reordering signal is present"
+    );
+    assert_eq!(80_000, a.cwnd);
+}
+
+#[test]
+fn test_enter_loss_recovery_ignores_configured_factor_without_reorder_signal() {
+    let mut a = create_association(
+        TransportConfig::default().with_rack_recovery_cwnd_factor_percent(80),
     );
     a.state = AssociationState::Established;
     a.mtu = 1200;
@@ -1610,10 +1650,9 @@ fn test_enter_loss_recovery_honors_configured_factor() {
 
     a.enter_loss_recovery();
 
-    assert!(a.in_fast_recovery);
     assert_eq!(
         50_000, a.ssthresh,
-        "configured 50% factor should restore standard halving"
+        "configured factor must not weaken the response when no reordering signal is present"
     );
     assert_eq!(50_000, a.cwnd);
 }

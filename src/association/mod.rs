@@ -3290,18 +3290,24 @@ impl Association {
             .inflight_queue
             .last_tsn()
             .unwrap_or(self.cumulative_tsn_ack_point);
-        let factor = self.rack_recovery_cwnd_factor_percent as u64;
-        let reduced = ((self.cwnd as u64) * factor / 100) as u32;
+        let reordering_signal = self.rack_keep_inflated_recoveries > 0;
+        let factor_pct: u8 = if reordering_signal {
+            self.rack_recovery_cwnd_factor_percent
+        } else {
+            50
+        };
+        let reduced = ((self.cwnd as u64) * factor_pct as u64 / 100) as u32;
         self.ssthresh = core::cmp::max(reduced, 4 * self.mtu);
         self.cwnd = self.ssthresh;
         self.partial_bytes_acked = 0;
         trace!(
-            "[{}] updated cwnd={} ssthresh={} inflight={} factor_pct={} (RACK)",
+            "[{}] updated cwnd={} ssthresh={} inflight={} factor_pct={} reorder_signal={} (RACK)",
             self.side,
             self.cwnd,
             self.ssthresh,
             self.inflight_queue.get_num_bytes(),
-            self.rack_recovery_cwnd_factor_percent
+            factor_pct,
+            reordering_signal
         );
     }
 
