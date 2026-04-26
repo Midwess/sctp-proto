@@ -1,5 +1,12 @@
 # Unreleased
 
+# 0.9.3
+
+  * Retune `TransportConfig::for_relay()` based on production data:
+    - Raise `rack_reo_wnd_floor` from 500ms to 800ms. Production logs at `2026-04-26T17:14` showed every RACK mark sitting at `delta_us = 500-700ms`, exactly on the prior floor — the floor was inside the path's natural delivery envelope, so RACK was firing on jitter, not loss. 800ms sits comfortably above the observed envelope while still well below the 1s T3-rtx safety net.
+    - Drop the `max_cwnd_bytes=Some(500_000)` cap (now `None`). The cap created a resonant failure mode: cwnd parked at the BDP-equivalent value, the relay queue stayed exactly full, any 50-100ms wobble pushed deliveries past `reo_wnd_floor`, mass RACK marks triggered, T3-rtx cascaded. Logs at `2026-04-26T17:14:40.903` show the collapse: cwnd hit 500_000, then 200ms later T3 fired with cwnd=1228. App-level reliable-channel watermarks already provide burst control upstream of SCTP; the SCTP-level cap was redundant and harmful.
+  * `for_relay()` now applies `rack_reo_wnd_floor=800ms`, `rack_recovery_cwnd_factor_percent=70` (gated; only fires on observed reordering), `max_init_retransmits=None`, `max_data_retransmits=None`, and the crate default for `max_cwnd_bytes` (None).
+
 # 0.9.2
 
   * Add `TransportConfig::for_relay()` profile bundling `rack_reo_wnd_floor=500ms`, `max_cwnd_bytes=Some(500_000)`, `rack_recovery_cwnd_factor_percent=70`, `max_init_retransmits=None`, `max_data_retransmits=None` for TURN-relayed paths.

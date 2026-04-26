@@ -152,8 +152,7 @@ impl TransportConfig {
         Self::default()
             .with_max_init_retransmits(None)
             .with_max_data_retransmits(None)
-            .with_rack_reo_wnd_floor(Duration::from_millis(500))
-            .with_max_cwnd_bytes(Some(500_000))
+            .with_rack_reo_wnd_floor(Duration::from_millis(800))
             .with_rack_recovery_cwnd_factor_percent(70)
     }
 
@@ -567,8 +566,8 @@ mod test {
 
         assert_eq!(None, config.max_init_retransmits());
         assert_eq!(None, config.max_data_retransmits());
-        assert_eq!(Duration::from_millis(500), config.get_rack_reo_wnd_floor());
-        assert_eq!(Some(500_000), config.get_max_cwnd_bytes());
+        assert_eq!(Duration::from_millis(800), config.get_rack_reo_wnd_floor());
+        assert_eq!(None, config.get_max_cwnd_bytes());
         assert_eq!(70, config.get_rack_recovery_cwnd_factor_percent());
         assert_eq!(Ok(()), config.validate());
     }
