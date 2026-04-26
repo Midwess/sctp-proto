@@ -271,6 +271,7 @@ pub struct Association {
     rack_min_rtt: Duration,
     rack_wc_del_ack: Duration,
     rack_recovery_cwnd_factor_percent: u8,
+    max_cwnd_bytes: Option<u32>,
     rack_delivered_time: Option<Instant>,
     rack_highest_delivered_orig_tsn: u32,
     rack_reordering_seen: bool,
@@ -380,6 +381,7 @@ impl Default for Association {
             rack_min_rtt: Duration::ZERO,
             rack_wc_del_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
             rack_recovery_cwnd_factor_percent: DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
+            max_cwnd_bytes: None,
             rack_delivered_time: None,
             rack_highest_delivered_orig_tsn: 0,
             rack_reordering_seen: false,
@@ -476,6 +478,7 @@ impl Association {
             rack_reo_wnd_floor: config.get_rack_reo_wnd_floor(),
             rack_wc_del_ack: config.get_rack_worst_case_delayed_ack(),
             rack_recovery_cwnd_factor_percent: config.get_rack_recovery_cwnd_factor_percent(),
+            max_cwnd_bytes: config.get_max_cwnd_bytes(),
             error: None,
 
             ..Default::default()
@@ -2179,6 +2182,9 @@ impl Association {
             if !self.in_fast_recovery && !self.pending_queue.is_empty() {
                 self.cwnd += core::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
                 // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
+                if let Some(cap) = self.max_cwnd_bytes {
+                    self.cwnd = self.cwnd.min(cap);
+                }
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (SS)",
                     self.side, self.cwnd, self.ssthresh, total_bytes_acked
@@ -2211,6 +2217,9 @@ impl Association {
             if self.partial_bytes_acked >= self.cwnd && !self.pending_queue.is_empty() {
                 self.partial_bytes_acked -= self.cwnd;
                 self.cwnd += self.mtu;
+                if let Some(cap) = self.max_cwnd_bytes {
+                    self.cwnd = self.cwnd.min(cap);
+                }
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (CA)",
                     self.side, self.cwnd, self.ssthresh, total_bytes_acked

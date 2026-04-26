@@ -29,6 +29,11 @@ pub(crate) const DEFAULT_RACK_REO_WND_FLOOR: Duration = Duration::from_millis(25
 pub(crate) const DEFAULT_RACK_WORST_CASE_DELAYED_ACK: Duration = Duration::from_millis(200);
 pub(crate) const DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT: u8 = 70;
 
+/// Minimum cwnd cap allowed when `max_cwnd_bytes` is `Some(_)`. Equal to the
+/// RFC 4960 §7.2.1 initial cwnd lower bound, so that a configured cap can never
+/// freeze the association before it has sent its first window.
+pub(crate) const MIN_MAX_CWND_BYTES: u32 = 4380;
+
 /// Errors returned when a [`TransportConfig`] contains invalid values.
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -42,6 +47,9 @@ pub enum TransportConfigError {
     /// RACK recovery cwnd factor must be in the range 1..=100.
     #[error("invalid RACK recovery cwnd factor: must be in the range 1..=100")]
     InvalidRackRecoveryCwndFactor,
+    /// A configured cwnd cap must be at least `MIN_MAX_CWND_BYTES`.
+    #[error("invalid max cwnd bytes: Some(v) requires v >= 4380")]
+    InvalidMaxCwndBytes,
 }
 
 /// Config collects the arguments to create_association construction into
@@ -101,6 +109,14 @@ pub struct TransportConfig {
     /// data may have only been delayed.
     /// Default: 70.
     rack_recovery_cwnd_factor_percent: u8,
+
+    /// Optional hard upper bound applied to `cwnd` after each congestion-control
+    /// increment. `None` (default) preserves standard RFC 4960 behavior. `Some(N)`
+    /// clamps the congestion window to at most `N` bytes, which is useful when a
+    /// downstream pipe (e.g. a TURN-relay egress queue) cannot absorb the bursts
+    /// produced by unbounded cwnd growth. Has no effect on RFC-defined reductions.
+    /// Default: None.
+    max_cwnd_bytes: Option<u32>,
 }
 
 impl Default for TransportConfig {
@@ -120,6 +136,7 @@ impl Default for TransportConfig {
             rack_reo_wnd_floor: DEFAULT_RACK_REO_WND_FLOOR,
             rack_worst_case_delayed_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
             rack_recovery_cwnd_factor_percent: DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
+            max_cwnd_bytes: None,
         }
     }
 }
@@ -135,6 +152,11 @@ impl TransportConfig {
         }
         if self.rack_recovery_cwnd_factor_percent == 0 || self.rack_recovery_cwnd_factor_percent > 100 {
             return Err(TransportConfigError::InvalidRackRecoveryCwndFactor);
+        }
+        if let Some(v) = self.max_cwnd_bytes {
+            if v < MIN_MAX_CWND_BYTES {
+                return Err(TransportConfigError::InvalidMaxCwndBytes);
+            }
         }
 
         Ok(())
@@ -246,6 +268,14 @@ impl TransportConfig {
         self
     }
 
+    /// Set an optional hard upper bound for `cwnd` (in bytes). `None` preserves
+    /// standard RFC 4960 unbounded growth. `Some(v)` requires `v >= 4380` and
+    /// clamps `cwnd` after every congestion-control increment.
+    pub fn with_max_cwnd_bytes(mut self, value: Option<u32>) -> Self {
+        self.max_cwnd_bytes = value;
+        self
+    }
+
     pub(crate) fn max_init_retransmits(&self) -> Option<usize> {
         self.max_init_retransmits
     }
@@ -284,6 +314,11 @@ impl TransportConfig {
     /// Get the configured RACK recovery cwnd factor (as a percentage in 1..=100).
     pub fn get_rack_recovery_cwnd_factor_percent(&self) -> u8 {
         self.rack_recovery_cwnd_factor_percent
+    }
+
+    /// Get the optional hard cap on `cwnd` in bytes.
+    pub fn get_max_cwnd_bytes(&self) -> Option<u32> {
+        self.max_cwnd_bytes
     }
 }
 
@@ -525,7 +560,29 @@ mod test {
             DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
             config.get_rack_recovery_cwnd_factor_percent()
         );
+        assert_eq!(None, config.get_max_cwnd_bytes());
         assert_eq!(Ok(()), config.validate());
+    }
+
+    #[test]
+    fn test_transport_config_max_cwnd_bytes_overrides() {
+        let cfg_none = TransportConfig::default().with_max_cwnd_bytes(None);
+        assert_eq!(None, cfg_none.get_max_cwnd_bytes());
+        assert_eq!(Ok(()), cfg_none.validate());
+
+        let cfg_some = TransportConfig::default().with_max_cwnd_bytes(Some(200_000));
+        assert_eq!(Some(200_000), cfg_some.get_max_cwnd_bytes());
+        assert_eq!(Ok(()), cfg_some.validate());
+
+        let cfg_min = TransportConfig::default().with_max_cwnd_bytes(Some(MIN_MAX_CWND_BYTES));
+        assert_eq!(Ok(()), cfg_min.validate());
+
+        let cfg_too_low =
+            TransportConfig::default().with_max_cwnd_bytes(Some(MIN_MAX_CWND_BYTES - 1));
+        assert_eq!(
+            Err(TransportConfigError::InvalidMaxCwndBytes),
+            cfg_too_low.validate()
+        );
     }
 
     #[test]
