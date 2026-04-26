@@ -25,7 +25,7 @@ pub(crate) const RTO_MAX: u64 = 60000;
 const DEFAULT_MAX_INIT_RETRANS: usize = 8;
 
 pub(crate) const DEFAULT_RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
-pub(crate) const DEFAULT_RACK_REO_WND_FLOOR: Duration = Duration::from_millis(150);
+pub(crate) const DEFAULT_RACK_REO_WND_FLOOR: Duration = Duration::from_millis(250);
 pub(crate) const DEFAULT_RACK_WORST_CASE_DELAYED_ACK: Duration = Duration::from_millis(200);
 
 /// Errors returned when a [`TransportConfig`] contains invalid values.
