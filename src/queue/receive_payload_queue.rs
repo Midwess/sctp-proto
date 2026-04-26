@@ -76,12 +76,12 @@ impl ReceivePayloadQueue {
         let tsn = p.tsn;
         !self.has_chunk(tsn)
             && !sna32lte(tsn, self.cumulative_tsn)
-            && !sna32gt(tsn, self.cumulative_tsn + self.max_tsn_offset)
+            && !sna32gt(tsn, self.cumulative_tsn.wrapping_add(self.max_tsn_offset))
     }
 
     pub(crate) fn push(&mut self, p: ChunkPayloadData) -> bool {
         let tsn = p.tsn;
-        if sna32gt(tsn, self.cumulative_tsn + self.max_tsn_offset) {
+        if sna32gt(tsn, self.cumulative_tsn.wrapping_add(self.max_tsn_offset)) {
             return false;
         }
 
