@@ -90,4 +90,6 @@ pub struct AssociationSnapshot {
     pub bytes_received: u64,
     pub rack_reo_wnd_us: u64,
     pub rack_min_rtt_us: u64,
+    pub rack_jitter_p95_us: u64,
+    pub rack_jitter_sample_count: u32,
 }

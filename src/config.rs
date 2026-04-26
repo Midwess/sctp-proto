@@ -123,6 +123,13 @@ pub struct TransportConfig {
     /// produced by unbounded cwnd growth. Has no effect on RFC-defined reductions.
     /// Default: None.
     max_cwnd_bytes: Option<u32>,
+
+    /// When true, RACK tracks per-association delivery jitter and dynamically expands
+    /// `rack_reo_wnd` above `rack_reo_wnd_floor` to match the observed envelope.
+    /// `rack_reo_wnd_floor` becomes a minimum below which the dynamic value never falls.
+    /// When false, RACK uses `rack_reo_wnd_floor` exactly as before this feature was added.
+    /// Default: true.
+    rack_adaptive: bool,
 }
 
 impl Default for TransportConfig {
@@ -143,6 +150,7 @@ impl Default for TransportConfig {
             rack_worst_case_delayed_ack: DEFAULT_RACK_WORST_CASE_DELAYED_ACK,
             rack_recovery_cwnd_factor_percent: DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
             max_cwnd_bytes: None,
+            rack_adaptive: true,
         }
     }
 }
@@ -152,7 +160,7 @@ impl TransportConfig {
         Self::default()
             .with_max_init_retransmits(None)
             .with_max_data_retransmits(None)
-            .with_rack_reo_wnd_floor(Duration::from_millis(1200))
+            .with_rack_reo_wnd_floor(Duration::from_millis(400))
             .with_rack_recovery_cwnd_factor_percent(70)
             .with_rto_min_ms(3000)
     }
@@ -334,6 +342,17 @@ impl TransportConfig {
     /// Get the optional hard cap on `cwnd` in bytes.
     pub fn get_max_cwnd_bytes(&self) -> Option<u32> {
         self.max_cwnd_bytes
+    }
+
+    /// Toggle the adaptive RACK reordering window.
+    pub fn with_rack_adaptive(mut self, value: bool) -> Self {
+        self.rack_adaptive = value;
+        self
+    }
+
+    /// Get whether the adaptive RACK reordering window is enabled.
+    pub fn get_rack_adaptive(&self) -> bool {
+        self.rack_adaptive
     }
 }
 
@@ -567,11 +586,28 @@ mod test {
 
         assert_eq!(None, config.max_init_retransmits());
         assert_eq!(None, config.max_data_retransmits());
-        assert_eq!(Duration::from_millis(1200), config.get_rack_reo_wnd_floor());
+        assert_eq!(Duration::from_millis(400), config.get_rack_reo_wnd_floor());
         assert_eq!(None, config.get_max_cwnd_bytes());
         assert_eq!(70, config.get_rack_recovery_cwnd_factor_percent());
         assert_eq!(3000, config.rto_min_ms());
+        assert!(config.get_rack_adaptive());
         assert_eq!(Ok(()), config.validate());
+    }
+
+    #[test]
+    fn test_transport_config_rack_adaptive_default_and_override() {
+        let default_cfg = TransportConfig::default();
+        assert!(default_cfg.get_rack_adaptive());
+
+        let opted_out = TransportConfig::default().with_rack_adaptive(false);
+        assert!(!opted_out.get_rack_adaptive());
+
+        let relay_opted_out = TransportConfig::for_relay().with_rack_adaptive(false);
+        assert!(!relay_opted_out.get_rack_adaptive());
+        assert_eq!(
+            Duration::from_millis(400),
+            relay_opted_out.get_rack_reo_wnd_floor()
+        );
     }
 
     #[test]

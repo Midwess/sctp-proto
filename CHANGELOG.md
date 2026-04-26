@@ -1,5 +1,17 @@
 # Unreleased
 
+# 0.10.0
+
+  * Adaptive RACK reordering window. The static `rack_reo_wnd_floor` knob, which we tuned six times in one day chasing a moving target (250ms → 400ms → 500ms → 800ms → 1200ms → and slot-dependent), is now a *minimum* below which the dynamic value cannot fall. A per-association `JitterTracker` records `delivered_send_time − chunk.send_time` for `nsent == 1` chunks, computes a sliding-window p95 (256-sample / 30-second cap), and scales by 1.3 to set the effective floor. Clamped above the static floor and below `rto_min_ms − 100ms` so RACK still fires before T3-rtx.
+  * `TransportConfig` gains `with_rack_adaptive(bool)` (default **true**). Set to `false` to restore exact pre-0.10 behavior. The static `rack_reo_wnd_floor` setter still works as before; it now serves as the cold-start / minimum value.
+  * `for_relay()` lowers its static floor from 1200ms to **400ms** — matching the lower-jitter cluster of TURN paths. The adaptive estimator handles the upper tail dynamically. Operators who want the prior conservative value can call `.with_rack_reo_wnd_floor(Duration::from_millis(1200))` after `for_relay()`.
+  * `AssociationSnapshot` gains `rack_jitter_p95_us: u64` and `rack_jitter_sample_count: u32` fields so the algorithm is observable in production. `0` for `rack_jitter_p95_us` indicates either cold start (< 16 samples) or `rack_adaptive=false`.
+  * `sctp-stats` log line includes `reo_jit_p95_us=` and `reo_jit_n=` fields.
+  * Path-change detection: when `rack_min_rtt` shifts by > 50% in either direction, the tracker resets so old samples don't mislead the new path.
+  * Production observation that motivated this work (`2026-04-26T17:47`): static `reo_wnd_floor=1200ms` was correct for two slots but the third slot's path had a wider envelope (~1290ms) and that slot RACK-thrashed at ~5 Mbps while the others ran at 25 Mbps. Adaptive lets each association find its own envelope without per-region retuning.
+  * Bumps version 0.9.5 → 0.10.0 (minor: behavior-change-by-default).
+  * 206/206 tests green (185 prior + 12 jitter_tracker unit + 8 SACK-driven integration + 1 config).
+
 # 0.9.5
 
   * Raise `for_relay()` `rack_reo_wnd_floor` from 800ms to 1200ms. Production trace at `2026-04-26T17:47` showed the path's jitter envelope under deeper bursts extends well past 800ms — RACK marks fired at `delta_us` between 800,000 and **1,051,425** µs across all three slots, halving cwnd repeatedly despite the chunks not being lost (just delayed by the larger relay queue depth that grows with cwnd). All three slots dropped from 880KB / 540KB / 87KB cwnd down to 21KB-40KB through ~11+ RACK events each. With `rto_min_ms=3000` already shipped in 0.9.4, there's headroom for `reo_wnd_floor=1200ms` without any T3-vs-RACK race; T3 still fires at 3s as the safety net for genuinely lost packets RACK fails to catch. Real-loss detection latency increases by 400ms in the worst case, which is acceptable for bulk relay transfers.

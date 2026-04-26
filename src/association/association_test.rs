@@ -1694,3 +1694,169 @@ fn test_enter_loss_recovery_is_idempotent_within_window() {
         "subsequent calls within the same recovery window must not reduce cwnd further"
     );
 }
+
+#[test]
+fn test_rack_adaptive_for_relay_profile_has_correct_defaults() {
+    let cfg = TransportConfig::for_relay();
+    assert!(cfg.get_rack_adaptive());
+    assert_eq!(Duration::from_millis(400), cfg.get_rack_reo_wnd_floor());
+}
+
+#[test]
+fn test_effective_floor_falls_back_to_static_when_cold() {
+    let cfg = TransportConfig::for_relay();
+    let a = create_association(cfg);
+    assert_eq!(
+        Duration::from_millis(400),
+        a.effective_rack_reo_wnd_floor(),
+        "cold tracker must use static floor"
+    );
+}
+
+#[test]
+fn test_effective_floor_grows_above_static_with_jitter() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    let now = Instant::now();
+    for _ in 0..32 {
+        a.jitter_tracker.record(now, 1_000_000);
+    }
+    let eff = a.effective_rack_reo_wnd_floor();
+    assert!(
+        eff >= Duration::from_micros(1_300_000),
+        "effective floor should track p95 × 1.3, got {:?}",
+        eff
+    );
+}
+
+#[test]
+fn test_effective_floor_clamped_below_rto_min_minus_100ms() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    let now = Instant::now();
+    for _ in 0..32 {
+        a.jitter_tracker.record(now, 10_000_000);
+    }
+    let eff = a.effective_rack_reo_wnd_floor();
+    let expected_cap = Duration::from_millis(2900);
+    assert!(
+        eff <= expected_cap,
+        "effective floor {:?} must not exceed rto_min - 100ms = {:?}",
+        eff,
+        expected_cap
+    );
+}
+
+#[test]
+fn test_effective_floor_static_when_adaptive_disabled() {
+    let cfg = TransportConfig::for_relay().with_rack_adaptive(false);
+    let mut a = create_association(cfg);
+    let now = Instant::now();
+    for _ in 0..32 {
+        a.jitter_tracker.record(now, 5_000_000);
+    }
+    assert_eq!(
+        Duration::from_millis(400),
+        a.effective_rack_reo_wnd_floor(),
+        "with rack_adaptive=false the static floor must be returned regardless of samples"
+    );
+}
+
+#[test]
+fn test_jitter_tracker_resets_on_path_change_via_min_rtt_shift() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    let now = Instant::now();
+    for _ in 0..32 {
+        a.jitter_tracker.record(now, 1_000_000);
+    }
+    a.jitter_tracker
+        .maybe_reset_on_path_change(Duration::from_millis(100));
+    assert_eq!(32, a.jitter_tracker.len());
+
+    a.jitter_tracker
+        .maybe_reset_on_path_change(Duration::from_millis(300));
+    assert_eq!(0, a.jitter_tracker.len());
+    assert_eq!(
+        Duration::from_millis(400),
+        a.effective_rack_reo_wnd_floor(),
+        "after path-change reset, effective floor returns to static",
+    );
+}
+
+#[test]
+fn test_jitter_tracker_records_samples_via_process_selective_ack() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    a.state = AssociationState::Established;
+    a.cumulative_tsn_ack_point = 99;
+
+    let t0 = Instant::now();
+    push_outstanding_chunk(&mut a, 100, t0, 100);
+    push_outstanding_chunk(&mut a, 101, t0 + Duration::from_millis(50), 100);
+    push_outstanding_chunk(&mut a, 102, t0 + Duration::from_millis(100), 100);
+
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 102,
+        advertised_receiver_window_credit: 1_000_000,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+
+    let now = t0 + Duration::from_millis(900);
+    a.process_selective_ack(&sack, now)
+        .expect("ack processing should succeed");
+
+    assert!(
+        a.jitter_tracker.len() >= 2,
+        "should record samples for nsent==1 chunks; got {}",
+        a.jitter_tracker.len()
+    );
+}
+
+#[test]
+fn test_jitter_tracker_skips_retransmitted_chunks() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    a.state = AssociationState::Established;
+    a.cumulative_tsn_ack_point = 99;
+
+    let t0 = Instant::now();
+    let user_len = 100;
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: 100,
+        since: Some(t0),
+        nsent: 2,
+        user_data: Bytes::from(vec![0; user_len]),
+        ..Default::default()
+    });
+    a.rack_insert(100);
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: 101,
+        since: Some(t0 + Duration::from_millis(50)),
+        nsent: 1,
+        user_data: Bytes::from(vec![0; user_len]),
+        ..Default::default()
+    });
+    a.rack_insert(101);
+
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 101,
+        advertised_receiver_window_credit: 1_000_000,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+    let now = t0 + Duration::from_millis(900);
+    a.process_selective_ack(&sack, now)
+        .expect("ack processing should succeed");
+
+    assert_eq!(
+        1,
+        a.jitter_tracker.len(),
+        "only the nsent==1 chunk should contribute a sample"
+    );
+}

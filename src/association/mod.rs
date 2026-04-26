@@ -64,10 +64,13 @@ use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
 
+mod jitter_tracker;
 pub(crate) mod state;
 pub(crate) mod stats;
 pub(crate) mod stream;
 mod timer;
+
+use jitter_tracker::JitterTracker;
 
 #[cfg(test)]
 mod association_test;
@@ -305,6 +308,9 @@ pub struct Association {
     last_logged_n_t3timeouts: u64,
     ack_state: AckState,
 
+    rack_adaptive: bool,
+    jitter_tracker: JitterTracker,
+
     // for testing
     pub(crate) ack_mode: AckMode,
 }
@@ -416,6 +422,9 @@ impl Default for Association {
             last_logged_n_t3timeouts: 0,
             ack_state: AckState::default(),
 
+            rack_adaptive: true,
+            jitter_tracker: JitterTracker::new(),
+
             // for testing
             ack_mode: AckMode::default(),
         }
@@ -481,6 +490,7 @@ impl Association {
             rack_wc_del_ack: config.get_rack_worst_case_delayed_ack(),
             rack_recovery_cwnd_factor_percent: config.get_rack_recovery_cwnd_factor_percent(),
             max_cwnd_bytes: config.get_max_cwnd_bytes(),
+            rack_adaptive: config.get_rack_adaptive(),
             error: None,
 
             ..Default::default()
@@ -800,6 +810,8 @@ impl Association {
             bytes_received: self.bytes_received as u64,
             rack_reo_wnd_us: self.rack_reo_wnd.as_micros() as u64,
             rack_min_rtt_us: self.rack_min_rtt.as_micros() as u64,
+            rack_jitter_p95_us: self.jitter_tracker.p95().unwrap_or(0),
+            rack_jitter_sample_count: self.jitter_tracker.len() as u32,
         }
     }
 
@@ -2007,6 +2019,7 @@ impl Association {
         let mut newest_delivered_send_time = None;
         let mut newest_delivered_orig_tsn = 0;
         let mut delivered_found = false;
+        let mut pending_jitter: Vec<Instant> = Vec::new();
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -2068,12 +2081,26 @@ impl Association {
                         newest_delivered_orig_tsn = c.tsn;
                         delivered_found = true;
                     }
+
+                    if c.nsent == 1 {
+                        if let Some(since) = c.since {
+                            pending_jitter.push(since);
+                        }
+                    }
                 }
             } else {
                 return Err(Error::ErrInflightQueueTsnPop);
             }
 
             i += 1;
+        }
+
+        if let Some(newest) = newest_delivered_send_time {
+            for since in pending_jitter {
+                let delta = newest.saturating_duration_since(since);
+                self.jitter_tracker
+                    .record(now, delta.as_micros() as u64);
+            }
         }
 
         let mut htna = d.cumulative_tsn_ack;
@@ -3143,7 +3170,7 @@ impl Association {
         macro_rules! emit {
             ($lvl:ident) => {
                 $lvl!(
-                    "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} reo_wnd_us={} min_rtt_us={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
+                    "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} reo_wnd_us={} min_rtt_us={} reo_jit_p95_us={} reo_jit_n={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
                     self.side,
                     self.peer_verification_tag,
                     self.cwnd,
@@ -3154,6 +3181,8 @@ impl Association {
                     self.rto_mgr.get_rto(),
                     self.rack_reo_wnd.as_micros() as u64,
                     self.rack_min_rtt.as_micros() as u64,
+                    self.jitter_tracker.p95().unwrap_or(0),
+                    self.jitter_tracker.len(),
                     self.inflight_queue.get_num_bytes(),
                     self.inflight_queue.len(),
                     self.pending_queue.get_num_bytes(),
@@ -3365,9 +3394,23 @@ impl Association {
             .start(Timer::Rack, now, Self::duration_to_millis(dur));
     }
 
+    fn effective_rack_reo_wnd_floor(&self) -> Duration {
+        if !self.rack_adaptive {
+            return self.rack_reo_wnd_floor;
+        }
+        let Some(p95_us) = self.jitter_tracker.p95() else {
+            return self.rack_reo_wnd_floor;
+        };
+        let scaled_us = p95_us.saturating_mul(130) / 100;
+        let rto_min_us = self.rto_mgr.rto_min.saturating_sub(100).saturating_mul(1_000);
+        let static_us = self.rack_reo_wnd_floor.as_micros() as u64;
+        let clamped = scaled_us.min(rto_min_us).max(static_us);
+        Duration::from_micros(clamped)
+    }
+
     fn base_rack_reo_wnd(&self) -> Duration {
         if self.rack_min_rtt > Duration::ZERO {
-            core::cmp::max(self.rack_min_rtt / 4, self.rack_reo_wnd_floor)
+            core::cmp::max(self.rack_min_rtt / 4, self.effective_rack_reo_wnd_floor())
         } else {
             Duration::ZERO
         }
@@ -3404,12 +3447,18 @@ impl Association {
             self.rack_min_rtt = min_rtt;
         }
 
+        if self.rack_adaptive {
+            self.jitter_tracker
+                .maybe_reset_on_path_change(self.rack_min_rtt);
+        }
+
+        let effective_floor = self.effective_rack_reo_wnd_floor();
         let base_reo_wnd = self.base_rack_reo_wnd();
 
         if !self.rack_reordering_seen
             && (self.in_fast_recovery || self.timers.get(Timer::T3RTX).is_some())
         {
-            self.rack_reo_wnd = self.rack_reo_wnd_floor;
+            self.rack_reo_wnd = effective_floor;
         } else if base_reo_wnd > self.rack_reo_wnd {
             self.rack_reo_wnd = base_reo_wnd;
         }
@@ -3427,7 +3476,7 @@ impl Association {
         }
 
         if let Some(srtt) = self.srtt_duration() {
-            let cap = core::cmp::max(srtt, self.rack_reo_wnd_floor);
+            let cap = core::cmp::max(srtt, effective_floor);
             if self.rack_reo_wnd > cap {
                 self.rack_reo_wnd = cap;
             }
