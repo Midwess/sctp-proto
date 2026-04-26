@@ -3462,6 +3462,12 @@ impl Association {
     fn mark_rack_losses(&mut self, now: Instant, delivered_time: Instant) -> bool {
         let mut marked = false;
         let mut current_tsn = self.rack_head_tsn;
+        let mut mark_count: u32 = 0;
+        let mut min_delta_us: u64 = u64::MAX;
+        let mut max_delta_us: u64 = 0;
+        let mut sum_delta_us: u64 = 0;
+        let mut first_marked_tsn: Option<u32> = None;
+        let mut last_marked_tsn: Option<u32> = None;
 
         while let Some(tsn) = current_tsn {
             let Some(chunk) = self.inflight_queue.get(tsn) else {
@@ -3496,6 +3502,20 @@ impl Association {
                 break;
             }
 
+            let delta_us = delivered_time.duration_since(sent_time).as_micros() as u64;
+            mark_count += 1;
+            if delta_us < min_delta_us {
+                min_delta_us = delta_us;
+            }
+            if delta_us > max_delta_us {
+                max_delta_us = delta_us;
+            }
+            sum_delta_us = sum_delta_us.saturating_add(delta_us);
+            if first_marked_tsn.is_none() {
+                first_marked_tsn = Some(tsn);
+            }
+            last_marked_tsn = Some(tsn);
+
             self.enter_loss_recovery();
             if let Some(chunk) = self.inflight_queue.get_mut(tsn) {
                 chunk.retransmit = true;
@@ -3504,6 +3524,26 @@ impl Association {
             self.rack_remove(tsn);
             marked = true;
             current_tsn = next_tsn;
+        }
+
+        if mark_count > 0 {
+            let avg_delta_us = sum_delta_us / mark_count as u64;
+            debug!(
+                "[{} {:08x}] rack-mark count={} tsn_first={:?} tsn_last={:?} delta_us min={} avg={} max={} reo_wnd_us={} min_rtt_us={} srtt_ms={} cwnd={} ssthresh={}",
+                self.side,
+                self.peer_verification_tag,
+                mark_count,
+                first_marked_tsn,
+                last_marked_tsn,
+                min_delta_us,
+                avg_delta_us,
+                max_delta_us,
+                self.rack_reo_wnd.as_micros() as u64,
+                self.rack_min_rtt.as_micros() as u64,
+                self.rto_mgr.srtt,
+                self.cwnd,
+                self.ssthresh,
+            );
         }
 
         if marked && self.tlr_active {
