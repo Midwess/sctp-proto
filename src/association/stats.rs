@@ -1,12 +1,12 @@
 /// Association statistics
 #[derive(Default, Debug, Copy, Clone)]
 pub struct AssociationStats {
-    n_datas: u64,
-    n_sacks: u64,
-    n_t3timeouts: u64,
-    n_ack_timeouts: u64,
-    n_rack_loss_marks: u64,
-    n_pto_timeouts: u64,
+    pub(crate) n_datas: u64,
+    pub(crate) n_sacks: u64,
+    pub(crate) n_t3timeouts: u64,
+    pub(crate) n_ack_timeouts: u64,
+    pub(crate) n_rack_loss_marks: u64,
+    pub(crate) n_pto_timeouts: u64,
 }
 
 impl AssociationStats {
@@ -66,4 +66,26 @@ impl AssociationStats {
         self.n_rack_loss_marks = 0;
         self.n_pto_timeouts = 0;
     }
+}
+
+#[derive(Default, Debug, Copy, Clone)]
+pub struct AssociationSnapshot {
+    pub n_datas: u64,
+    pub n_sacks: u64,
+    pub n_t3timeouts: u64,
+    pub n_ack_timeouts: u64,
+    pub n_rack_loss_marks: u64,
+    pub n_pto_timeouts: u64,
+    pub cwnd: u32,
+    pub ssthresh: u32,
+    pub rwnd: u32,
+    pub in_fast_recovery: bool,
+    pub srtt_ms: u64,
+    pub rto_ms: u64,
+    pub inflight_bytes: u64,
+    pub inflight_chunks: u64,
+    pub pending_bytes: u64,
+    pub pending_chunks: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }

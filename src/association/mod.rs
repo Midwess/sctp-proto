@@ -299,6 +299,7 @@ pub struct Association {
     immediate_ack_triggered: bool,
 
     pub(crate) stats: AssociationStats,
+    last_stats_log: Option<Instant>,
     ack_state: AckState,
 
     // for testing
@@ -406,6 +407,7 @@ impl Default for Association {
             immediate_ack_triggered: false,
 
             stats: AssociationStats::default(),
+            last_stats_log: None,
             ack_state: AckState::default(),
 
             // for testing
@@ -667,6 +669,7 @@ impl Association {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
+        self.maybe_log_stats(now);
         let (contents, _) = self.gather_outbound(now);
         if contents.is_empty() {
             None
@@ -765,6 +768,29 @@ impl Association {
     /// Returns Association statistics
     pub fn stats(&self) -> AssociationStats {
         self.stats
+    }
+
+    pub fn snapshot(&self) -> stats::AssociationSnapshot {
+        stats::AssociationSnapshot {
+            n_datas: self.stats.n_datas,
+            n_sacks: self.stats.n_sacks,
+            n_t3timeouts: self.stats.n_t3timeouts,
+            n_ack_timeouts: self.stats.n_ack_timeouts,
+            n_rack_loss_marks: self.stats.n_rack_loss_marks,
+            n_pto_timeouts: self.stats.n_pto_timeouts,
+            cwnd: self.cwnd,
+            ssthresh: self.ssthresh,
+            rwnd: self.rwnd,
+            in_fast_recovery: self.in_fast_recovery,
+            srtt_ms: self.rto_mgr.srtt,
+            rto_ms: self.rto_mgr.get_rto(),
+            inflight_bytes: self.inflight_queue.get_num_bytes() as u64,
+            inflight_chunks: self.inflight_queue.len() as u64,
+            pending_bytes: self.pending_queue.get_num_bytes() as u64,
+            pending_chunks: self.pending_queue.len() as u64,
+            bytes_sent: self.bytes_sent as u64,
+            bytes_received: self.bytes_received as u64,
+        }
     }
 
     /// Whether the Association is in the process of being established
@@ -3077,6 +3103,41 @@ impl Association {
         } else {
             Some(Duration::from_millis(self.rto_mgr.srtt))
         }
+    }
+
+    fn maybe_log_stats(&mut self, now: Instant) {
+        if self.state != AssociationState::Established {
+            return;
+        }
+        let due = match self.last_stats_log {
+            Some(t) => now.saturating_duration_since(t) >= Duration::from_secs(1),
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_stats_log = Some(now);
+        debug!(
+            "[{}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
+            self.side,
+            self.cwnd,
+            self.ssthresh,
+            self.rwnd,
+            self.in_fast_recovery,
+            self.rto_mgr.srtt,
+            self.rto_mgr.get_rto(),
+            self.inflight_queue.get_num_bytes(),
+            self.inflight_queue.len(),
+            self.pending_queue.get_num_bytes(),
+            self.pending_queue.len(),
+            self.bytes_sent,
+            self.bytes_received,
+            self.stats.n_datas,
+            self.stats.n_sacks,
+            self.stats.n_rack_loss_marks,
+            self.stats.n_t3timeouts,
+            self.stats.n_pto_timeouts,
+        );
     }
 
     fn duration_to_millis(duration: Duration) -> u64 {

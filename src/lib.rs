@@ -64,7 +64,7 @@ mod association;
 pub use crate::association::Association;
 pub use crate::association::AssociationError;
 pub use crate::association::Event;
-pub use crate::association::stats::AssociationStats;
+pub use crate::association::stats::{AssociationSnapshot, AssociationStats};
 pub use crate::association::stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
 
 pub(crate) mod chunk;
