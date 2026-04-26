@@ -1,5 +1,15 @@
 # Unreleased
 
+# 0.9.2
+
+  * Add `TransportConfig::for_relay()` profile bundling `rack_reo_wnd_floor=500ms`, `max_cwnd_bytes=Some(500_000)`, `rack_recovery_cwnd_factor_percent=70`, `max_init_retransmits=None`, `max_data_retransmits=None` for TURN-relayed paths.
+  * Promote the periodic `sctp-stats` log line from `debug!` to `info!` when the association is stuck (in fast recovery, T3-rtx fired since last log, or pending bytes > 4 × cwnd) so production diagnoses do not require enabling debug logs.
+
+# 0.9.1
+
+  * Default `rack_recovery_cwnd_factor_percent` to 50 (RFC 4960 halving).
+  * Gate RACK soft cwnd factor on observed reordering signal (`rack_keep_inflated_recoveries > 0`); otherwise fall back to standard halving.
+
 # 0.9.0
 
   * Add support for out of band negotiation for SNAP #34

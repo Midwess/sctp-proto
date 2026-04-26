@@ -57,7 +57,7 @@ use core::net::{IpAddr, SocketAddr};
 use core::num::NonZeroU32;
 use core::str::FromStr;
 use core::time::Duration;
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use rand::random;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -302,6 +302,7 @@ pub struct Association {
 
     pub(crate) stats: AssociationStats,
     last_stats_log: Option<Instant>,
+    last_logged_n_t3timeouts: u64,
     ack_state: AckState,
 
     // for testing
@@ -412,6 +413,7 @@ impl Default for Association {
 
             stats: AssociationStats::default(),
             last_stats_log: None,
+            last_logged_n_t3timeouts: 0,
             ack_state: AckState::default(),
 
             // for testing
@@ -3131,30 +3133,46 @@ impl Association {
             return;
         }
         self.last_stats_log = Some(now);
-        debug!(
-            "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} reo_wnd_us={} min_rtt_us={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
-            self.side,
-            self.peer_verification_tag,
-            self.cwnd,
-            self.ssthresh,
-            self.rwnd,
-            self.in_fast_recovery,
-            self.rto_mgr.srtt,
-            self.rto_mgr.get_rto(),
-            self.rack_reo_wnd.as_micros() as u64,
-            self.rack_min_rtt.as_micros() as u64,
-            self.inflight_queue.get_num_bytes(),
-            self.inflight_queue.len(),
-            self.pending_queue.get_num_bytes(),
-            self.pending_queue.len(),
-            self.bytes_sent,
-            self.bytes_received,
-            self.stats.n_datas,
-            self.stats.n_sacks,
-            self.stats.n_rack_loss_marks,
-            self.stats.n_t3timeouts,
-            self.stats.n_pto_timeouts,
-        );
+        let pending_bytes = self.pending_queue.get_num_bytes() as u64;
+        let cwnd_bytes = self.cwnd as u64;
+        let stuck = self.in_fast_recovery
+            || self.stats.n_t3timeouts > self.last_logged_n_t3timeouts
+            || (cwnd_bytes > 0 && pending_bytes > cwnd_bytes.saturating_mul(4));
+        self.last_logged_n_t3timeouts = self.stats.n_t3timeouts;
+
+        macro_rules! emit {
+            ($lvl:ident) => {
+                $lvl!(
+                    "[{} {:08x}] sctp-stats cwnd={} ssthresh={} rwnd={} fr={} srtt_ms={} rto_ms={} reo_wnd_us={} min_rtt_us={} inflight={}B/{}c pending={}B/{}c sent={} recv={} datas={} sacks={} rack_marks={} t3={} pto={}",
+                    self.side,
+                    self.peer_verification_tag,
+                    self.cwnd,
+                    self.ssthresh,
+                    self.rwnd,
+                    self.in_fast_recovery,
+                    self.rto_mgr.srtt,
+                    self.rto_mgr.get_rto(),
+                    self.rack_reo_wnd.as_micros() as u64,
+                    self.rack_min_rtt.as_micros() as u64,
+                    self.inflight_queue.get_num_bytes(),
+                    self.inflight_queue.len(),
+                    self.pending_queue.get_num_bytes(),
+                    self.pending_queue.len(),
+                    self.bytes_sent,
+                    self.bytes_received,
+                    self.stats.n_datas,
+                    self.stats.n_sacks,
+                    self.stats.n_rack_loss_marks,
+                    self.stats.n_t3timeouts,
+                    self.stats.n_pto_timeouts,
+                )
+            };
+        }
+        if stuck {
+            emit!(info);
+        } else {
+            emit!(debug);
+        }
     }
 
     fn duration_to_millis(duration: Duration) -> u64 {

@@ -148,6 +148,15 @@ impl Default for TransportConfig {
 }
 
 impl TransportConfig {
+    pub fn for_relay() -> Self {
+        Self::default()
+            .with_max_init_retransmits(None)
+            .with_max_data_retransmits(None)
+            .with_rack_reo_wnd_floor(Duration::from_millis(500))
+            .with_max_cwnd_bytes(Some(500_000))
+            .with_rack_recovery_cwnd_factor_percent(70)
+    }
+
     /// Validate configuration values that cannot be represented as type-level invariants.
     pub fn validate(&self) -> Result<(), TransportConfigError> {
         if self.rack_min_rtt_window.is_zero() {
@@ -551,6 +560,18 @@ pub fn generate_snap_token(config: &TransportConfig) -> Result<Bytes, crate::err
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_transport_config_for_relay_profile() {
+        let config = TransportConfig::for_relay();
+
+        assert_eq!(None, config.max_init_retransmits());
+        assert_eq!(None, config.max_data_retransmits());
+        assert_eq!(Duration::from_millis(500), config.get_rack_reo_wnd_floor());
+        assert_eq!(Some(500_000), config.get_max_cwnd_bytes());
+        assert_eq!(70, config.get_rack_recovery_cwnd_factor_percent());
+        assert_eq!(Ok(()), config.validate());
+    }
 
     #[test]
     fn test_transport_config_rack_defaults() {
