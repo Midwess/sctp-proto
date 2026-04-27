@@ -1,5 +1,11 @@
 # Unreleased
 
+# 0.10.6
+
+  * **Revert `for_relay()` `max_cwnd_bytes` 400 KB -> 250 KB.** Production trace at `2026-04-27T07:25` showed initial-burst damage on bad TURN allocations: slow-start raced cwnd to the 400 KB cap in ~3 RTTs, blasted the relay queue, and triggered 49+ RACK marks at delta=1208-1247us before the historical-max sticky-floor had a chance to lift. cwnd then cycled 400KB -> 200KB -> 100KB -> 50KB -> 35KB. Slot 9428ddf5 on a healthier TURN allocation rode the 400 KB cap fine with zero rack_marks for 20+ seconds, demonstrating the 0.10.5 algorithm IS correct -- the bottleneck is per-allocation TURN drain rate, not our cwnd cap. Lowering to 250 KB caps the initial burst at ~62% of the prior peak, reducing initial queue-fill so fewer marks fire before adaptive locks. Healthy paths cap at ~13 Mbps per slot vs ~21 Mbps; aggregate ~40 Mbps still acceptable, more predictable across path quality.
+  * **The TURN cluster remains the real fix.** No SCTP-side knob fully recovers the bad-TURN slots (2f3e6c6f, 662e7ccc) -- they show RACK marks at delta=1.2-1.7s persistently because the upstream allocation has insufficient drain rate. Per-allocation TURN admission control or larger egress buffers are the operational fix.
+  * 213/213 tests green. No code changes outside config.rs.
+
 # 0.10.5
 
   * **Fix the self-defeating historical-max bound shipped in 0.10.4.** The 0.10.4 formula was `min(h, 2×static)/2`, which caps at `(2×static)/2 = static` for any historical value. Effect: historical_max contribution can never exceed the static floor, defeating the entire 0.10.3 sticky-floor mechanism. Production trace at `2026-04-27T06:05` slot e8a804c6 demonstrated this: path envelope at 1.20-1.32s, static floor at 1200ms, historical observed at 1.3s -- but `1.3 / 2 = 0.65s < 1.2s`, so the floor stayed at static and marks at 1.20-1.32s kept firing. Cwnd cycled 250KB → 59KB → 37KB and eventually hit T3-rtx (`cwnd=1228 ssthresh=18707`). Drop the `/2` divisor; keep the 2×static bound. New formula: `floor = max(p95×1.3, min(historical, 2×static), static)` clamped at `rto_min - 100ms`. With static=1200ms, historical contribution can now lift the floor up to 2400ms, which is the actual point of the sticky-floor feature.
