@@ -20,6 +20,12 @@ pub(crate) struct JitterTracker {
     window: Duration,
     max_samples: usize,
     reference_min_rtt: Option<Duration>,
+    /// Highest p95 ever observed on this association since the last path-change
+    /// reset. Used by the floor computation as a cold-start anchor: when the
+    /// 30-second sliding window decays back into the bulk after a quiet period,
+    /// the dynamic floor still gets a lower bound of `historical_max_p95 / 2`,
+    /// preventing the next jitter burst from re-paying the full warmup penalty.
+    historical_max_p95: Option<u64>,
 }
 
 impl JitterTracker {
@@ -29,6 +35,7 @@ impl JitterTracker {
             window: DEFAULT_WINDOW,
             max_samples: DEFAULT_MAX_SAMPLES,
             reference_min_rtt: None,
+            historical_max_p95: None,
         }
     }
 
@@ -57,9 +64,23 @@ impl JitterTracker {
         self.samples.len()
     }
 
+    /// Record the most recent p95 reading so the tracker can remember the
+    /// historical maximum across sample-window decay. Caller fetches `p95()`
+    /// and forwards the value here once per RACK pass.
+    pub(crate) fn note_p95(&mut self, p95: u64) {
+        if self.historical_max_p95.is_none_or(|h| p95 > h) {
+            self.historical_max_p95 = Some(p95);
+        }
+    }
+
+    pub(crate) fn historical_max_p95(&self) -> Option<u64> {
+        self.historical_max_p95
+    }
+
     pub(crate) fn reset(&mut self) {
         self.samples.clear();
         self.reference_min_rtt = None;
+        self.historical_max_p95 = None;
     }
 
     pub(crate) fn maybe_reset_on_path_change(&mut self, current_min_rtt: Duration) {
@@ -82,6 +103,7 @@ impl JitterTracker {
                 if ratio > PATH_CHANGE_RATIO_PERCENT {
                     self.samples.clear();
                     self.reference_min_rtt = Some(current_min_rtt);
+                    self.historical_max_p95 = None;
                 }
             }
         }
@@ -257,5 +279,36 @@ mod tests {
         assert_eq!(None, tracker.p95());
         tracker.maybe_reset_on_path_change(Duration::from_millis(100));
         assert_eq!(0, tracker.len());
+    }
+
+    #[test]
+    fn test_note_p95_tracks_running_maximum() {
+        let mut tracker = JitterTracker::new();
+        assert_eq!(None, tracker.historical_max_p95());
+        tracker.note_p95(500);
+        assert_eq!(Some(500), tracker.historical_max_p95());
+        tracker.note_p95(1500);
+        assert_eq!(Some(1500), tracker.historical_max_p95());
+        tracker.note_p95(800);
+        assert_eq!(Some(1500), tracker.historical_max_p95());
+    }
+
+    #[test]
+    fn test_historical_max_cleared_on_reset() {
+        let mut tracker = JitterTracker::new();
+        tracker.note_p95(2_000_000);
+        assert_eq!(Some(2_000_000), tracker.historical_max_p95());
+        tracker.reset();
+        assert_eq!(None, tracker.historical_max_p95());
+    }
+
+    #[test]
+    fn test_historical_max_cleared_on_path_change() {
+        let mut tracker = JitterTracker::new();
+        tracker.note_p95(2_000_000);
+        tracker.maybe_reset_on_path_change(Duration::from_millis(100));
+        assert_eq!(Some(2_000_000), tracker.historical_max_p95());
+        tracker.maybe_reset_on_path_change(Duration::from_millis(300));
+        assert_eq!(None, tracker.historical_max_p95());
     }
 }

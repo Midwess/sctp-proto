@@ -3414,14 +3414,27 @@ impl Association {
         if !self.rack_adaptive {
             return self.rack_reo_wnd_floor;
         }
-        let Some(p95_us) = self.jitter_tracker.p95() else {
-            return self.rack_reo_wnd_floor;
-        };
-        let scaled_us = p95_us.saturating_mul(130) / 100;
-        let rto_min_us = self.rto_mgr.rto_min.saturating_sub(100).saturating_mul(1_000);
         let static_us = self.rack_reo_wnd_floor.as_micros() as u64;
-        let clamped = scaled_us.min(rto_min_us).max(static_us);
-        Duration::from_micros(clamped)
+        let rto_min_us = self.rto_mgr.rto_min.saturating_sub(100).saturating_mul(1_000);
+
+        let scaled_us = self
+            .jitter_tracker
+            .p95()
+            .map(|p| p.saturating_mul(130) / 100)
+            .unwrap_or(0);
+
+        // Half of the historical-max p95 acts as a sticky floor across sample-
+        // window decay: once we observed e.g. p95=2000ms on this association,
+        // the dynamic floor never falls below 1000ms again until the path
+        // changes (min_rtt shifts > 50%, which resets the tracker).
+        let historical_floor_us = self
+            .jitter_tracker
+            .historical_max_p95()
+            .map(|h| h / 2)
+            .unwrap_or(0);
+
+        let target = scaled_us.max(historical_floor_us).max(static_us);
+        Duration::from_micros(target.min(rto_min_us))
     }
 
     fn base_rack_reo_wnd(&self) -> Duration {
@@ -3466,6 +3479,9 @@ impl Association {
         if self.rack_adaptive {
             self.jitter_tracker
                 .maybe_reset_on_path_change(self.rack_min_rtt);
+            if let Some(p95) = self.jitter_tracker.p95() {
+                self.jitter_tracker.note_p95(p95);
+            }
         }
 
         let effective_floor = self.effective_rack_reo_wnd_floor();

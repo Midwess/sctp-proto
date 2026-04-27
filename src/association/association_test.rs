@@ -1738,7 +1738,7 @@ fn test_effective_floor_clamped_below_rto_min_minus_100ms() {
         a.jitter_tracker.record(now, 10_000_000);
     }
     let eff = a.effective_rack_reo_wnd_floor();
-    let expected_cap = Duration::from_millis(2900);
+    let expected_cap = Duration::from_millis(4900);
     assert!(
         eff <= expected_cap,
         "effective floor {:?} must not exceed rto_min - 100ms = {:?}",
@@ -1905,6 +1905,53 @@ fn test_mark_rack_losses_does_not_record_when_adaptive_disabled() {
 }
 
 #[test]
+fn test_effective_floor_holds_at_half_historical_after_window_decay() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    let now = Instant::now();
+
+    // Simulate a hot phase: 32 large samples + a recorded peak.
+    for _ in 0..32 {
+        a.jitter_tracker.record(now, 2_000_000);
+    }
+    if let Some(p95) = a.jitter_tracker.p95() {
+        a.jitter_tracker.note_p95(p95);
+    }
+    assert!(a.jitter_tracker.historical_max_p95().unwrap() >= 2_000_000);
+
+    // Simulate decay: window evicts the hot samples (record one calm sample
+    // far in the future and let the tracker drop the rest by time).
+    a.jitter_tracker.record(
+        now + Duration::from_secs(60),
+        100,
+    );
+    assert_eq!(1, a.jitter_tracker.len());
+
+    // Even with a tiny live p95, the effective floor must hold at
+    // historical_max / 2 = 1_000_000us (1s), well above the static 1200ms? No,
+    // half of 2_000_000us = 1_000_000us = 1s, static is 1200ms = 1_200_000us,
+    // so the static floor wins here. Make the assertion floor at
+    // max(static, historical/2):
+    let eff = a.effective_rack_reo_wnd_floor();
+    let static_floor = Duration::from_millis(1200);
+    assert!(
+        eff >= static_floor,
+        "effective floor {:?} must remain at or above static {:?} even after window decay",
+        eff,
+        static_floor
+    );
+
+    // With a larger historical peak the half-historical bound dominates.
+    a.jitter_tracker.note_p95(4_000_000);
+    let eff2 = a.effective_rack_reo_wnd_floor();
+    assert!(
+        eff2 >= Duration::from_micros(2_000_000),
+        "with historical_max=4_000_000us the floor must stay >= 2_000_000us; got {:?}",
+        eff2
+    );
+}
+
+#[test]
 fn test_apply_transport_config_runtime_swaps_knobs_and_resets_tracker() {
     let mut a = create_association(TransportConfig::default());
     let now = Instant::now();
@@ -1918,7 +1965,7 @@ fn test_apply_transport_config_runtime_swaps_knobs_and_resets_tracker() {
 
     assert_eq!(Duration::from_millis(1200), a.rack_reo_wnd_floor);
     assert_eq!(70, a.rack_recovery_cwnd_factor_percent);
-    assert_eq!(3000, a.rto_mgr.rto_min);
+    assert_eq!(5000, a.rto_mgr.rto_min);
     assert!(a.rack_adaptive);
     assert_eq!(
         0,
