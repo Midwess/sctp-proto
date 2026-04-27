@@ -1738,7 +1738,7 @@ fn test_effective_floor_clamped_below_rto_min_minus_100ms() {
         a.jitter_tracker.record(now, 10_000_000);
     }
     let eff = a.effective_rack_reo_wnd_floor();
-    let expected_cap = Duration::from_millis(4900);
+    let expected_cap = Duration::from_millis(2900);
     assert!(
         eff <= expected_cap,
         "effective floor {:?} must not exceed rto_min - 100ms = {:?}",
@@ -1941,12 +1941,18 @@ fn test_effective_floor_holds_at_half_historical_after_window_decay() {
         static_floor
     );
 
-    // With a larger historical peak the half-historical bound dominates.
-    a.jitter_tracker.note_p95(4_000_000);
+    // Historical-max contribution is capped at 2× static_floor to prevent the
+    // bufferbloat-driven runaway ratchet observed in production at 05:47:
+    // record an arbitrarily large historical peak; it gets clamped at
+    // 2 × 1200ms = 2400ms before the /2 division, so historical_floor_us
+    // contribution is at most 1200ms (= static). Effective floor stays at
+    // static, not at historical/2.
+    a.jitter_tracker.note_p95(8_000_000);
     let eff2 = a.effective_rack_reo_wnd_floor();
-    assert!(
-        eff2 >= Duration::from_micros(2_000_000),
-        "with historical_max=4_000_000us the floor must stay >= 2_000_000us; got {:?}",
+    assert_eq!(
+        Duration::from_micros(1_200_000),
+        eff2,
+        "historical_max contribution must be bounded at 2× static_floor; got {:?}",
         eff2
     );
 }
@@ -1965,7 +1971,7 @@ fn test_apply_transport_config_runtime_swaps_knobs_and_resets_tracker() {
 
     assert_eq!(Duration::from_millis(1200), a.rack_reo_wnd_floor);
     assert_eq!(70, a.rack_recovery_cwnd_factor_percent);
-    assert_eq!(5000, a.rto_mgr.rto_min);
+    assert_eq!(3000, a.rto_mgr.rto_min);
     assert!(a.rack_adaptive);
     assert_eq!(
         0,

@@ -3427,10 +3427,18 @@ impl Association {
         // window decay: once we observed e.g. p95=2000ms on this association,
         // the dynamic floor never falls below 1000ms again until the path
         // changes (min_rtt shifts > 50%, which resets the tracker).
+        //
+        // Cap historical at 2× the static floor so a bufferbloat-driven path --
+        // where each adaptive lift just enables more sending and the queue depth
+        // grows back -- can't ratchet historical_max past a useful bound. With
+        // static=1200ms this caps historical at 2400ms, so historical_floor
+        // contribution is at most 1200ms. Beyond that, the cwnd cap in
+        // for_relay() does the work of preventing further queue-depth growth.
+        let historical_bound_us = static_us.saturating_mul(2);
         let historical_floor_us = self
             .jitter_tracker
             .historical_max_p95()
-            .map(|h| h / 2)
+            .map(|h| h.min(historical_bound_us) / 2)
             .unwrap_or(0);
 
         let target = scaled_us.max(historical_floor_us).max(static_us);
