@@ -1905,54 +1905,46 @@ fn test_mark_rack_losses_does_not_record_when_adaptive_disabled() {
 }
 
 #[test]
-fn test_effective_floor_holds_at_half_historical_after_window_decay() {
+fn test_effective_floor_holds_at_historical_after_window_decay() {
     let cfg = TransportConfig::for_relay();
     let mut a = create_association(cfg);
     let now = Instant::now();
 
-    // Simulate a hot phase: 32 large samples + a recorded peak.
+    // Simulate a hot phase: 32 samples at 1.5s -- this is the path's
+    // observed envelope, slightly above static (1200ms). Record the peak.
     for _ in 0..32 {
-        a.jitter_tracker.record(now, 2_000_000);
+        a.jitter_tracker.record(now, 1_500_000);
     }
     if let Some(p95) = a.jitter_tracker.p95() {
         a.jitter_tracker.note_p95(p95);
     }
-    assert!(a.jitter_tracker.historical_max_p95().unwrap() >= 2_000_000);
+    assert!(a.jitter_tracker.historical_max_p95().unwrap() >= 1_500_000);
 
     // Simulate decay: window evicts the hot samples (record one calm sample
     // far in the future and let the tracker drop the rest by time).
-    a.jitter_tracker.record(
-        now + Duration::from_secs(60),
-        100,
-    );
+    a.jitter_tracker.record(now + Duration::from_secs(60), 100);
     assert_eq!(1, a.jitter_tracker.len());
 
-    // Even with a tiny live p95, the effective floor must hold at
-    // historical_max / 2 = 1_000_000us (1s), well above the static 1200ms? No,
-    // half of 2_000_000us = 1_000_000us = 1s, static is 1200ms = 1_200_000us,
-    // so the static floor wins here. Make the assertion floor at
-    // max(static, historical/2):
+    // Even with a tiny live p95, the effective floor must hold at the
+    // observed historical peak (1.5s), not fall back to static (1.2s).
+    // The next jitter burst lands in an already-warmed window.
     let eff = a.effective_rack_reo_wnd_floor();
-    let static_floor = Duration::from_millis(1200);
-    assert!(
-        eff >= static_floor,
-        "effective floor {:?} must remain at or above static {:?} even after window decay",
+    assert_eq!(
+        Duration::from_micros(1_500_000),
         eff,
-        static_floor
+        "effective floor must stay at historical_max (1.5s) after window decay; got {:?}",
+        eff
     );
 
-    // Historical-max contribution is capped at 2× static_floor to prevent the
-    // bufferbloat-driven runaway ratchet observed in production at 05:47:
-    // record an arbitrarily large historical peak; it gets clamped at
-    // 2 × 1200ms = 2400ms before the /2 division, so historical_floor_us
-    // contribution is at most 1200ms (= static). Effective floor stays at
-    // static, not at historical/2.
+    // Historical-max contribution is bounded at 2× static_floor to prevent
+    // the bufferbloat-driven runaway ratchet observed in production at 05:47.
+    // An arbitrarily large historical peak gets clamped at 2 × 1200ms = 2400ms.
     a.jitter_tracker.note_p95(8_000_000);
     let eff2 = a.effective_rack_reo_wnd_floor();
     assert_eq!(
-        Duration::from_micros(1_200_000),
+        Duration::from_micros(2_400_000),
         eff2,
-        "historical_max contribution must be bounded at 2× static_floor; got {:?}",
+        "historical contribution must be bounded at 2× static_floor; got {:?}",
         eff2
     );
 }

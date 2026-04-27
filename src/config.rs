@@ -163,7 +163,7 @@ impl TransportConfig {
             .with_rack_reo_wnd_floor(Duration::from_millis(1200))
             .with_rack_recovery_cwnd_factor_percent(70)
             .with_rto_min_ms(3000)
-            .with_max_cwnd_bytes(Some(250_000))
+            .with_max_cwnd_bytes(Some(400_000))
     }
 
     /// Validate configuration values that cannot be represented as type-level invariants.
@@ -588,7 +588,7 @@ mod test {
         assert_eq!(None, config.max_init_retransmits());
         assert_eq!(None, config.max_data_retransmits());
         assert_eq!(Duration::from_millis(1200), config.get_rack_reo_wnd_floor());
-        assert_eq!(Some(250_000), config.get_max_cwnd_bytes());
+        assert_eq!(Some(400_000), config.get_max_cwnd_bytes());
         assert_eq!(70, config.get_rack_recovery_cwnd_factor_percent());
         assert_eq!(3000, config.rto_min_ms());
         assert!(config.get_rack_adaptive());

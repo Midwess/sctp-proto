@@ -3423,22 +3423,23 @@ impl Association {
             .map(|p| p.saturating_mul(130) / 100)
             .unwrap_or(0);
 
-        // Half of the historical-max p95 acts as a sticky floor across sample-
-        // window decay: once we observed e.g. p95=2000ms on this association,
-        // the dynamic floor never falls below 1000ms again until the path
-        // changes (min_rtt shifts > 50%, which resets the tracker).
+        // Sticky historical-max floor across sample-window decay. Once the
+        // tracker has observed a p95 of e.g. 1300ms on this association, the
+        // dynamic floor stays at 1300ms even after the 30-second window
+        // evicts those samples -- the next jitter burst doesn't have to
+        // re-pay the warmup penalty. Cleared by maybe_reset_on_path_change
+        // when min_rtt shifts >50%.
         //
-        // Cap historical at 2× the static floor so a bufferbloat-driven path --
-        // where each adaptive lift just enables more sending and the queue depth
-        // grows back -- can't ratchet historical_max past a useful bound. With
-        // static=1200ms this caps historical at 2400ms, so historical_floor
-        // contribution is at most 1200ms. Beyond that, the cwnd cap in
-        // for_relay() does the work of preventing further queue-depth growth.
+        // Bound the historical contribution at 2× the static floor so a
+        // bufferbloat-driven path -- where each adaptive lift enables more
+        // sending and the queue depth grows back -- can't ratchet the floor
+        // indefinitely. Combined with the cwnd cap in for_relay(), this
+        // caps the runaway at static×2 (e.g. 2400ms with static=1200ms).
         let historical_bound_us = static_us.saturating_mul(2);
         let historical_floor_us = self
             .jitter_tracker
             .historical_max_p95()
-            .map(|h| h.min(historical_bound_us) / 2)
+            .map(|h| h.min(historical_bound_us))
             .unwrap_or(0);
 
         let target = scaled_us.max(historical_floor_us).max(static_us);
