@@ -1,5 +1,11 @@
 # Unreleased
 
+# 0.10.2
+
+  * Restore `for_relay()` static `rack_reo_wnd_floor` from 400ms back to **1200ms** (the 0.9.5 baseline). The 0.10.0 thesis -- "lower static, let adaptive lift" -- only works when RACK marks are a meaningful fraction of the sample window. Production trace at `2026-04-27T05:13` showed a relay path with a tight 400-450ms envelope and only ~5% mark-density. On that path the sampling fix lands the marks in the tracker correctly, but they're too few to drag p95 above the in-order bulk, so the dynamic floor stays at the static value -- and 400ms was below the path's natural envelope, causing chronic RACK over-firing and cwnd grind. The lesson: static floor must be set conservatively against observed historical worst case; adaptive lifts above it only on outlier paths where marks dominate the window. Slot `b534cfb3` in the same trace, with envelope 400-1210ms and dense marks, confirmed the adaptive lift works (p95 climbed `400k -> 893k`, `reo_wnd_us` reached 1163ms). With static back at 1200ms, light-mark slots regain the 0.9.5 throughput baseline; heavy-mark slots still get adaptive lift on top.
+  * No algorithm changes -- 0.10.1's adaptive sampling and `apply_transport_config_runtime` are unchanged.
+  * 209/209 tests green.
+
 # 0.10.1
 
   * **Adaptive RACK sampling fix.** Previously the `JitterTracker` recorded `delta_us` only for `nsent == 1` chunks at SACK time (Karn's filter). But the chunks that actually experience large jitter are exactly the ones RACK marks and retransmits — once retransmitted, they carry `nsent ≥ 2` and were silently excluded from the very distribution they should dominate. Production trace at `2026-04-26T18:39` showed `reo_jit_p95_us` of 200-9000 µs while RACK marks were firing at delta=400-700 ms: the estimator was constitutionally blind to its own tail. Now `mark_rack_losses` records each marked chunk's `delta_us` directly into the tracker, so p95 reflects the actual reorder envelope and `effective_rack_reo_wnd_floor` lifts above the static floor when needed.

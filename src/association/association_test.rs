@@ -1699,7 +1699,7 @@ fn test_enter_loss_recovery_is_idempotent_within_window() {
 fn test_rack_adaptive_for_relay_profile_has_correct_defaults() {
     let cfg = TransportConfig::for_relay();
     assert!(cfg.get_rack_adaptive());
-    assert_eq!(Duration::from_millis(400), cfg.get_rack_reo_wnd_floor());
+    assert_eq!(Duration::from_millis(1200), cfg.get_rack_reo_wnd_floor());
 }
 
 #[test]
@@ -1707,7 +1707,7 @@ fn test_effective_floor_falls_back_to_static_when_cold() {
     let cfg = TransportConfig::for_relay();
     let a = create_association(cfg);
     assert_eq!(
-        Duration::from_millis(400),
+        Duration::from_millis(1200),
         a.effective_rack_reo_wnd_floor(),
         "cold tracker must use static floor"
     );
@@ -1756,7 +1756,7 @@ fn test_effective_floor_static_when_adaptive_disabled() {
         a.jitter_tracker.record(now, 5_000_000);
     }
     assert_eq!(
-        Duration::from_millis(400),
+        Duration::from_millis(1200),
         a.effective_rack_reo_wnd_floor(),
         "with rack_adaptive=false the static floor must be returned regardless of samples"
     );
@@ -1778,7 +1778,7 @@ fn test_jitter_tracker_resets_on_path_change_via_min_rtt_shift() {
         .maybe_reset_on_path_change(Duration::from_millis(300));
     assert_eq!(0, a.jitter_tracker.len());
     assert_eq!(
-        Duration::from_millis(400),
+        Duration::from_millis(1200),
         a.effective_rack_reo_wnd_floor(),
         "after path-change reset, effective floor returns to static",
     );
@@ -1916,7 +1916,7 @@ fn test_apply_transport_config_runtime_swaps_knobs_and_resets_tracker() {
     let relay = TransportConfig::for_relay();
     a.apply_transport_config_runtime(&relay);
 
-    assert_eq!(Duration::from_millis(400), a.rack_reo_wnd_floor);
+    assert_eq!(Duration::from_millis(1200), a.rack_reo_wnd_floor);
     assert_eq!(70, a.rack_recovery_cwnd_factor_percent);
     assert_eq!(3000, a.rto_mgr.rto_min);
     assert!(a.rack_adaptive);
