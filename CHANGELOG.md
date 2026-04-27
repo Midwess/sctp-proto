@@ -1,5 +1,11 @@
 # Unreleased
 
+# 0.10.1
+
+  * **Adaptive RACK sampling fix.** Previously the `JitterTracker` recorded `delta_us` only for `nsent == 1` chunks at SACK time (Karn's filter). But the chunks that actually experience large jitter are exactly the ones RACK marks and retransmits — once retransmitted, they carry `nsent ≥ 2` and were silently excluded from the very distribution they should dominate. Production trace at `2026-04-26T18:39` showed `reo_jit_p95_us` of 200-9000 µs while RACK marks were firing at delta=400-700 ms: the estimator was constitutionally blind to its own tail. Now `mark_rack_losses` records each marked chunk's `delta_us` directly into the tracker, so p95 reflects the actual reorder envelope and `effective_rack_reo_wnd_floor` lifts above the static floor when needed.
+  * `Association::apply_transport_config_runtime(&TransportConfig)` — live-swap the runtime-tunable RACK / RTO knobs (`rack_reo_wnd_floor`, `rack_recovery_cwnd_factor_percent`, `rack_adaptive`, `rack_worst_case_delayed_ack`, `max_cwnd_bytes`, `rto_min_ms`, `rto_max_ms`) on an established association. Resets the `JitterTracker` so stale samples from the prior path don't bias the new one. Intended for upper layers (e.g. ICE) that want to swap presets when the active path type changes (host/srflx ↔ relay) without tearing down the association.
+  * 209/209 tests green (206 prior + 2 mark-time-sampling + 1 runtime-config-swap).
+
 # 0.10.0
 
   * Adaptive RACK reordering window. The static `rack_reo_wnd_floor` knob, which we tuned six times in one day chasing a moving target (250ms → 400ms → 500ms → 800ms → 1200ms → and slot-dependent), is now a *minimum* below which the dynamic value cannot fall. A per-association `JitterTracker` records `delivered_send_time − chunk.send_time` for `nsent == 1` chunks, computes a sliding-window p95 (256-sample / 30-second cap), and scales by 1.3 to set the effective floor. Clamped above the static floor and below `rto_min_ms − 100ms` so RACK still fires before T3-rtx.

@@ -875,6 +875,22 @@ impl Association {
         self.local_ip
     }
 
+    /// Apply a [`TransportConfig`] to a live association, swapping the runtime-tunable
+    /// RACK and RTO knobs in place. Useful when the upper layer (e.g. ICE) detects a
+    /// path-type change (host/srflx ↔ relay) and wants the SCTP transport to adopt a
+    /// preset matched to the new path without tearing down the association. Resets the
+    /// jitter tracker so stale samples from the old path don't bias the new one.
+    pub fn apply_transport_config_runtime(&mut self, config: &TransportConfig) {
+        self.rack_reo_wnd_floor = config.get_rack_reo_wnd_floor();
+        self.rack_recovery_cwnd_factor_percent = config.get_rack_recovery_cwnd_factor_percent();
+        self.rack_adaptive = config.get_rack_adaptive();
+        self.rack_wc_del_ack = config.get_rack_worst_case_delayed_ack();
+        self.max_cwnd_bytes = config.get_max_cwnd_bytes();
+        self.rto_mgr.rto_min = config.rto_min_ms();
+        self.rto_mgr.rto_max = config.rto_max_ms();
+        self.jitter_tracker.reset();
+    }
+
     /// Shutdown initiates the shutdown sequence. The method blocks until the
     /// shutdown sequence is completed and the association is closed, or until the
     /// passed context is done, in which case the context's error is returned.
@@ -3593,6 +3609,9 @@ impl Association {
 
             let delta_us = delivered_time.duration_since(sent_time).as_micros() as u64;
             mark_count += 1;
+            if self.rack_adaptive {
+                self.jitter_tracker.record(now, delta_us);
+            }
             if delta_us < min_delta_us {
                 min_delta_us = delta_us;
             }

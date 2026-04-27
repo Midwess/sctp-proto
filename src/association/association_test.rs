@@ -1860,3 +1860,78 @@ fn test_jitter_tracker_skips_retransmitted_chunks() {
         "only the nsent==1 chunk should contribute a sample"
     );
 }
+
+#[test]
+fn test_mark_rack_losses_records_delta_into_jitter_tracker() {
+    let cfg = TransportConfig::for_relay();
+    let mut a = create_association(cfg);
+    a.state = AssociationState::Established;
+    a.cumulative_tsn_ack_point = 99;
+    a.rack_reo_wnd = Duration::from_millis(100);
+
+    let t0 = Instant::now();
+    push_outstanding_chunk(&mut a, 100, t0, 100);
+    push_outstanding_chunk(&mut a, 101, t0 + Duration::from_millis(10), 100);
+
+    let delivered = t0 + Duration::from_millis(800);
+    let now = delivered;
+    let marked = a.mark_rack_losses(now, delivered);
+    assert!(marked, "chunks past reo_wnd must be marked");
+    assert_eq!(
+        2,
+        a.jitter_tracker.len(),
+        "each marked chunk must inject a delta sample so the tracker can see the tail"
+    );
+}
+
+#[test]
+fn test_mark_rack_losses_does_not_record_when_adaptive_disabled() {
+    let cfg = TransportConfig::for_relay().with_rack_adaptive(false);
+    let mut a = create_association(cfg);
+    a.state = AssociationState::Established;
+    a.cumulative_tsn_ack_point = 99;
+    a.rack_reo_wnd = Duration::from_millis(100);
+
+    let t0 = Instant::now();
+    push_outstanding_chunk(&mut a, 100, t0, 100);
+
+    let delivered = t0 + Duration::from_millis(800);
+    a.mark_rack_losses(delivered, delivered);
+    assert_eq!(
+        0,
+        a.jitter_tracker.len(),
+        "with rack_adaptive=false the tracker stays empty"
+    );
+}
+
+#[test]
+fn test_apply_transport_config_runtime_swaps_knobs_and_resets_tracker() {
+    let mut a = create_association(TransportConfig::default());
+    let now = Instant::now();
+    for _ in 0..32 {
+        a.jitter_tracker.record(now, 1_000_000);
+    }
+    assert_eq!(32, a.jitter_tracker.len());
+
+    let relay = TransportConfig::for_relay();
+    a.apply_transport_config_runtime(&relay);
+
+    assert_eq!(Duration::from_millis(400), a.rack_reo_wnd_floor);
+    assert_eq!(70, a.rack_recovery_cwnd_factor_percent);
+    assert_eq!(3000, a.rto_mgr.rto_min);
+    assert!(a.rack_adaptive);
+    assert_eq!(
+        0,
+        a.jitter_tracker.len(),
+        "tracker must reset on path swap"
+    );
+
+    let direct = TransportConfig::default();
+    a.apply_transport_config_runtime(&direct);
+    assert_eq!(DEFAULT_RACK_REO_WND_FLOOR, a.rack_reo_wnd_floor);
+    assert_eq!(
+        DEFAULT_RACK_RECOVERY_CWND_FACTOR_PERCENT,
+        a.rack_recovery_cwnd_factor_percent
+    );
+    assert_eq!(1000, a.rto_mgr.rto_min);
+}
